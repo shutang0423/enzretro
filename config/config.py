@@ -25,13 +25,14 @@ MODEL_CONFIG = {
 }
 
 TRAIN_CONFIG = {
-    "batch_size":  8,
+    "batch_size":  32,
     "lr":          1e-4,
-    "num_epochs":  100,
+    "num_epochs":  10,
 }
 
 PATH_CONFIG = {
     "vocab_file":   "tokenizer/vocab.txt",
     "train_data":   "dataset/uspto50k/pretrained/uspto50k_train_output.json",
     "test_data":    "dataset/uspto50k/pretrained/uspto50k_test_output.json",
+    "ckpt_path":    "ckpt/best_model.pt",
 }

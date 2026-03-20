@@ -239,7 +239,19 @@ Actor Network 是强化学习的核心，负责决策下一步的编辑操作。
 │  cond_type   : -                                        │
 └─────────────────────────────────────────────────────────┘
 ```
+功能：维护解码器状态，生成编辑序列
 
+架构：
+
+- 6 层 Transformer Decoder Layer，每层包含：
+    - Self-Attention：捕捉历史编辑之间的依赖关系
+    - Cross-Attention：每个编辑关注整个产物图的所有节点
+    - Feed-Forward Network：非线性变换
+
+- 关键机制：
+    - 因果掩码 (Causal Mask)：防止看到未来的编辑
+    - 位置编码 (Positional Encoding)：编码编辑的顺序信息
+    - 残差连接 + Layer Norm：稳定训练
 
 #### 3.2 三个预测器各自的损失函数
 
@@ -255,19 +267,32 @@ $$\mathcal{L}_{label} = \frac{1}{T}\sum_{t=1}^{T}\text{CrossEntropy}(\hat{y}_{la
 
 
 
-功能：维护解码器状态，生成编辑序列
+#### 3.3 训练策略
 
-架构：
+当前是一个经典的**多任务学习（Multi-Task Learning）**问题。
 
-- 6 层 Transformer Decoder Layer，每层包含：
-    - Self-Attention：捕捉历史编辑之间的依赖关系
-    - Cross-Attention：每个编辑关注整个产物图的所有节点
-    - Feed-Forward Network：非线性变换
+本项目采用的训练策略是：**分阶段课程训练（Curriculum Learning）+自动权重平衡（Uncertainty Weighting）**,先用课程学习让各任务独立收敛，再用 Uncertainty Weighting 做联合微调，兼顾稳定性和自动化。
 
-- 关键机制：
-    - 因果掩码 (Causal Mask)：防止看到未来的编辑
-    - 位置编码 (Positional Encoding)：编码编辑的顺序信息
-    - 残差连接 + Layer Norm：稳定训练
+
+1. 按依赖顺序分阶段预热，最后联合微调：
+```makefile
+阶段1: 只训 action（最简单，先收敛）
+阶段2: 冻结 action，训 src + tgt
+阶段3: 冻结前两阶段，训 label
+阶段4: 解冻全部，联合微调（小 lr）
+```
+2. 自动权重平衡,全自动，无需手调权重
+```python
+# Uncertainty Weighting (Kendall et al. 2018)
+loss = sum(exp(-log_sigma_i) * loss_i + log_sigma_i)
+# log_sigma 作为可学习参数，自动平衡各项
+```
+
+
+
+
+
+
 
 ## 4. Action Predictor
 
