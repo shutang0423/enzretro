@@ -2,4 +2,5 @@ dataset
 .*/
 */__pycache__
 *.log
+ckpt
 

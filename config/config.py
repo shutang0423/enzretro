@@ -35,4 +35,5 @@ PATH_CONFIG = {
     "train_data":   "dataset/uspto50k/pretrained/uspto50k_train_output.json",
     "test_data":    "dataset/uspto50k/pretrained/uspto50k_test_output.json",
     "ckpt_path":    "ckpt/best_model.pt",
+    "log_dir":      "ckpt/pretrain",
 }
