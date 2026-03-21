@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.optim.lr_scheduler import LambdaLR
+from torch.utils.tensorboard import SummaryWriter   # ← 新增
 from torch_geometric.loader import DataLoader
 from torch_geometric.utils import to_dense_batch
 from tqdm import tqdm
@@ -16,163 +18,242 @@ PC = PATH_CONFIG
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# ── 1. 数据 ────────────────────────────────────────────────────────────────
-tokenizer = LabelTokenizer(vocab_file=PC["vocab_file"])
+# ══════════════════════════════════════════════════════════════════════════
+#  TensorBoard Writer
+# ══════════════════════════════════════════════════════════════════════════
+writer = SummaryWriter(log_dir=PC.get("log_dir", "runs/pretrain"))
+# 启动命令（终端执行）: tensorboard --logdir runs/pretrain
 
-dataset = SSRGraphDataset(
-    json_path=PC["test_data"],
-    tokenizer=tokenizer,
-    max_seq_len=C["max_seq_len"],
-    max_hist_len=C["max_hist_len"],
-)
-dataloader = DataLoader(dataset, batch_size=TC["batch_size"], shuffle=True)
+# ══════════════════════════════════════════════════════════════════════════
+#  Uncertainty Weighting
+# ══════════════════════════════════════════════════════════════════════════
+class UncertaintyWeighting(nn.Module):
+    def __init__(self, num_tasks: int):
+        super().__init__()
+        self.log_sigma = nn.Parameter(torch.zeros(num_tasks))
 
-# ── 2. 模型 ────────────────────────────────────────────────────────────────
-vocab_size = tokenizer.get_vocab_size()
-model      = ActorPretrainer(vocab_size=vocab_size).to(device)
-optimizer  = optim.Adam(model.parameters(), lr=TC["lr"])
+    def forward(self, *losses):
+        weighted = [torch.exp(-self.log_sigma[i]) * l + self.log_sigma[i]
+                    for i, l in enumerate(losses)]
+        return sum(weighted), [l.item() for l in weighted]
 
-criterion_cls = nn.CrossEntropyLoss(ignore_index=-1)
-criterion_seq = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
+    def weights(self):
+        return torch.exp(-self.log_sigma).detach().cpu().tolist()
 
-# ── 3. NaN 检测工具 ────────────────────────────────────────────────────────
-def check_nan(tensor, name):
-    if torch.isnan(tensor).any() or torch.isinf(tensor).any():
-        print(f"  [NaN/Inf detected] {name}")
-        return True
-    return False
+
+# ══════════════════════════════════════════════════════════════════════════
+#  分阶段课程训练配置
+# ══════════════════════════════════════════════════════════════════════════
+STAGES = [
+    {"name": "Stage1-Action",  "epochs": TC.get("stage1_epochs", 10),
+     "tasks": ["action"],           "freeze": ["pointer_network", "label_decoder"]},
+    {"name": "Stage2-Pointer", "epochs": TC.get("stage2_epochs", 15),
+     "tasks": ["src", "tgt"],       "freeze": ["action_predictor", "label_decoder"]},
+    {"name": "Stage3-Label",   "epochs": TC.get("stage3_epochs", 15),
+     "tasks": ["label"],            "freeze": ["action_predictor", "pointer_network"]},
+    {"name": "Stage4-Joint",   "epochs": TC.get("stage4_epochs", 60),
+     "tasks": ["action", "src", "tgt", "label"], "freeze": []},
+]
+
+
+def set_freeze(model, freeze_modules):
+    for p in model.parameters():
+        p.requires_grad = True
+    for name in freeze_modules:
+        module = getattr(model, name, None)
+        if module:
+            for p in module.parameters():
+                p.requires_grad = False
+
+
+def make_optimizer_scheduler(model, uw, total_steps, lr):
+    params    = [p for p in model.parameters() if p.requires_grad] + list(uw.parameters())
+    optimizer = optim.AdamW(params, lr=lr, weight_decay=1e-2)
+    warmup    = int(total_steps * 0.1)
+    def lr_lambda(step):
+        if step < warmup:
+            return float(step) / max(1, warmup)
+        progress = float(step - warmup) / max(1, total_steps - warmup)
+        return max(0.0, 0.5 * (1.0 + torch.cos(torch.tensor(3.14159 * progress)).item()))
+    return optimizer, LambdaLR(optimizer, lr_lambda)
+
 
 def safe_loss(logits, target, criterion, name):
-    """计算 loss，若结果为 NaN 则打印诊断信息并返回 0"""
     loss = criterion(logits, target)
     if torch.isnan(loss) or torch.isinf(loss):
-        print(f"  [NaN Loss] {name} | logits range: "
-              f"[{logits.min():.3f}, {logits.max():.3f}] "
-              f"| target range: [{target.min()}, {target.max()}]")
+        print(f"\n  [NaN] {name}")
         return torch.tensor(0.0, device=logits.device, requires_grad=True)
     return loss
 
-# ── 4. 训练循环 ────────────────────────────────────────────────────────────
-model.train()
 
-for epoch in range(TC["num_epochs"]):
-    # 每个 epoch 的累计 loss
-    sum_loss        = 0.0
-    sum_loss_action = 0.0
-    sum_loss_src    = 0.0
-    sum_loss_tgt    = 0.0
-    sum_loss_label  = 0.0
-    num_batches     = 0
+# ══════════════════════════════════════════════════════════════════════════
+#  数据 & 模型
+# ══════════════════════════════════════════════════════════════════════════
+tokenizer  = LabelTokenizer(vocab_file=PC["vocab_file"])
+dataset    = SSRGraphDataset(
+    json_path=PC["train_data"], tokenizer=tokenizer,
+    max_seq_len=C["max_seq_len"], max_hist_len=C["max_hist_len"],
+)
+dataloader = DataLoader(dataset, batch_size=TC["batch_size"], shuffle=True)
+vocab_size = tokenizer.get_vocab_size()
 
-    # tqdm 进度条：显示当前 epoch 和 step 级别的实时 loss
-    pbar = tqdm(
-        dataloader,
-        desc=f"Epoch [{epoch+1:>3}/{TC['num_epochs']}]",
-        ncols=120,
-        leave=True,
+model = ActorPretrainer(vocab_size=vocab_size).to(device)
+
+def init_weights(m):
+    if isinstance(m, nn.Embedding):   nn.init.normal_(m.weight, 0.0, 0.02)
+    elif isinstance(m, nn.Linear):
+        nn.init.xavier_uniform_(m.weight)
+        if m.bias is not None: nn.init.zeros_(m.bias)
+model.apply(init_weights)
+
+uw            = UncertaintyWeighting(num_tasks=4).to(device)
+criterion_cls = nn.CrossEntropyLoss(ignore_index=-1)
+criterion_seq = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
+
+# ══════════════════════════════════════════════════════════════════════════
+#  保存最优模型
+# ══════════════════════════════════════════════════════════════════════════
+best_loss = float("inf")
+CKPT_PATH = PC.get("ckpt_path", "best_model.pt")
+
+def save_best(avg_loss, epoch_tag):
+    global best_loss
+    if avg_loss < best_loss:
+        best_loss = avg_loss
+        torch.save({
+            "model": model.state_dict(), "uw": uw.state_dict(),
+            "loss": best_loss, "epoch_tag": epoch_tag,
+        }, CKPT_PATH)
+        print(f"  ✅ Best model saved  loss={best_loss:.4f}  → {CKPT_PATH}")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  分阶段训练主循环
+# ══════════════════════════════════════════════════════════════════════════
+global_epoch = 0
+global_step  = 0   # ← step 级别记录用
+
+for stage in STAGES:
+    stage_name   = stage["name"]
+    stage_epochs = stage["epochs"]
+    active_tasks = set(stage["tasks"])
+    is_joint     = (stage_name == "Stage4-Joint")
+
+    print(f"\n{'='*60}\n  {stage_name}  tasks={active_tasks}  epochs={stage_epochs}\n{'='*60}")
+    set_freeze(model, stage["freeze"])
+
+    stage_lr = TC["lr"] / 5 if is_joint else TC["lr"]
+    optimizer, scheduler = make_optimizer_scheduler(
+        model, uw, stage_epochs * len(dataloader), lr=stage_lr
     )
 
-    for batch in pbar:
-        batch = batch.to(device)
-        optimizer.zero_grad()
+    for epoch in range(stage_epochs):
+        global_epoch += 1
+        sum_loss = sum_act = sum_src = sum_tgt = sum_lbl = 0.0
+        num_batches = 0
 
-        # ── A. 图特征编码 ────────────────────────────────────────────────
-        node_embeddings, graph_embedding = model.graph_encoder(
-            batch.x, batch.edge_index, batch.batch
-        )
-        graph_state   = model.state_proj(graph_embedding)
+        pbar = tqdm(dataloader,
+                    desc=f"{stage_name} Ep[{epoch+1}/{stage_epochs}]",
+                    ncols=150, leave=True)
+        model.train()
 
-        # ── B. 历史状态融合 ──────────────────────────────────────────────
-        decoder_state = model.state_tracker(batch.history_actions, graph_state)
+        for batch in pbar:
+            batch = batch.to(device)
+            optimizer.zero_grad()
 
-        # ── C. squeeze 保证 target 均为 1D [B] ──────────────────────────
-        target_action = batch.target_action.squeeze(-1)   # [B]
-        target_src    = batch.target_src.squeeze(-1)      # [B]
-        target_tgt    = batch.target_tgt.squeeze(-1)      # [B]
+            node_embeddings, graph_embedding = model.graph_encoder(
+                batch.x, batch.edge_index, batch.batch)
+            graph_state   = model.state_proj(graph_embedding)
+            decoder_state = model.state_tracker(batch.history_actions, graph_state)
 
-        # ── D. 动作类型预测 ──────────────────────────────────────────────
-        action_logits = model.action_predictor(decoder_state)   # [B, num_actions]
-        loss_action   = safe_loss(action_logits, target_action,
-                                  criterion_cls, "loss_action")
+            target_action = batch.target_action.squeeze(-1)
+            target_src    = batch.target_src.squeeze(-1)
+            target_tgt    = batch.target_tgt.squeeze(-1)
 
-        # ── E. 指针网络 ──────────────────────────────────────────────────
-        dense_nodes, node_mask_bool = to_dense_batch(node_embeddings, batch.batch)
-        # key_padding_mask: True = 忽略该位置（padding）
-        node_mask = ~node_mask_bool                        # [B, N]
+            action_logits = model.action_predictor(decoder_state)
+            loss_action   = safe_loss(action_logits, target_action, criterion_cls, "action")
 
-        src_logits, tgt_logits = model.pointer_network(
-            decoder_state, dense_nodes, target_action,
-            target_src_idx=target_src,
-            node_mask=node_mask,
-        )
-        # src/tgt logits: [B, N]，过滤掉 target 越界的样本
-        N         = src_logits.size(-1)
-        valid_src = (target_src >= 0) & (target_src < N)
-        valid_tgt = (target_tgt >= 0) & (target_tgt < N)
+            dense_nodes, node_mask_bool = to_dense_batch(node_embeddings, batch.batch)
+            src_logits, tgt_logits = model.pointer_network(
+                decoder_state, dense_nodes, target_action,
+                target_src_idx=target_src, node_mask=~node_mask_bool)
 
-        if valid_src.any():
-            loss_src = safe_loss(src_logits[valid_src], target_src[valid_src],
-                                 criterion_cls, "loss_src")
-        else:
-            loss_src = torch.tensor(0.0, device=device, requires_grad=True)
+            N         = src_logits.size(-1)
+            valid_src = (target_src >= 0) & (target_src < N)
+            valid_tgt = (target_tgt >= 0) & (target_tgt < N)
+            loss_src  = (safe_loss(src_logits[valid_src], target_src[valid_src], criterion_cls, "src")
+                         if valid_src.any() else torch.tensor(0.0, device=device, requires_grad=True))
+            loss_tgt  = (safe_loss(tgt_logits[valid_tgt], target_tgt[valid_tgt], criterion_cls, "tgt")
+                         if valid_tgt.any() else torch.tensor(0.0, device=device, requires_grad=True))
 
-        if valid_tgt.any():
-            loss_tgt = safe_loss(tgt_logits[valid_tgt], target_tgt[valid_tgt],
-                                 criterion_cls, "loss_tgt")
-        else:
-            loss_tgt = torch.tensor(0.0, device=device, requires_grad=True)
+            label_logits = model.label_decoder(
+                decoder_state, target_action, batch.target_label[:, :-1])
+            loss_label   = safe_loss(
+                label_logits.reshape(-1, vocab_size),
+                batch.target_label[:, 1:].reshape(-1), criterion_seq, "label")
 
-        # ── F. Label 解码器 ──────────────────────────────────────────────
-        decoder_input_seq = batch.target_label[:, :-1]    # [B, L-1]
-        label_target_seq  = batch.target_label[:, 1:]     # [B, L-1]
+            if "action" not in active_tasks: loss_action = loss_action.detach()
+            if "src"    not in active_tasks: loss_src    = loss_src.detach()
+            if "tgt"    not in active_tasks: loss_tgt    = loss_tgt.detach()
+            if "label"  not in active_tasks: loss_label  = loss_label.detach()
 
-        label_logits = model.label_decoder(
-            decoder_state, target_action, decoder_input_seq
-        )                                                  # [B, L-1, vocab_size]
+            loss, _ = uw(loss_action, loss_src, loss_tgt, loss_label)
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            scheduler.step()
+            global_step += 1
 
-        loss_label = safe_loss(
-            label_logits.reshape(-1, vocab_size),
-            label_target_seq.reshape(-1),
-            criterion_seq, "loss_label"
-        )
+            # ── Step 级别写入（每步记录，曲线最细粒度）────────────────
+            cur_lr = scheduler.get_last_lr()[0]
+            writer.add_scalars(f"{stage_name}/step_loss", {
+                "total":  loss.item(),
+                "action": loss_action.item(),
+                "src":    loss_src.item(),
+                "tgt":    loss_tgt.item(),
+                "label":  loss_label.item(),
+            }, global_step)
+            writer.add_scalar("lr", cur_lr, global_step)
 
-        # ── G. 总 Loss + 梯度裁剪 ────────────────────────────────────────
-        loss = loss_action + loss_src + loss_tgt + loss_label
-        loss.backward()
-        # 梯度裁剪，防止梯度爆炸导致 NaN
-        nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
+            la, ls, lt, ll = (loss_action.item(), loss_src.item(),
+                              loss_tgt.item(),    loss_label.item())
+            tot = loss.item()
+            sum_loss += tot; sum_act += la; sum_src += ls
+            sum_tgt  += lt;  sum_lbl += ll; num_batches += 1
 
-        # ── H. 累计统计 ──────────────────────────────────────────────────
-        la  = loss_action.item()
-        ls  = loss_src.item()
-        lt  = loss_tgt.item()
-        ll  = loss_label.item()
-        tot = loss.item()
+            w = uw.weights()
+            pbar.set_postfix({
+                "tot":   f"{tot:.3f}",
+                "act":   f"{la:.3f}({w[0]:.2f})",
+                "src":   f"{ls:.3f}({w[1]:.2f})",
+                "tgt":   f"{lt:.3f}({w[2]:.2f})",
+                "label": f"{ll:.3f}({w[3]:.2f})",
+                "lr":    f"{cur_lr:.1e}",
+            })
 
-        sum_loss        += tot
-        sum_loss_action += la
-        sum_loss_src    += ls
-        sum_loss_tgt    += lt
-        sum_loss_label  += ll
-        num_batches     += 1
+        # ── Epoch 级别写入（每 epoch 记录平均 loss）───────────────────
+        n   = max(num_batches, 1)
+        avg = sum_loss / n
+        w   = uw.weights()
 
-        # 进度条实时显示当前 step 的各项 loss
-        pbar.set_postfix({
-            "tot":    f"{tot:.3f}",
-            "act":    f"{la:.3f}",
-            "src":    f"{ls:.3f}",
-            "tgt":    f"{lt:.3f}",
-            "label":  f"{ll:.3f}",
-        })
+        writer.add_scalars(f"{stage_name}/epoch_loss", {
+            "total":  avg,
+            "action": sum_act / n,
+            "src":    sum_src / n,
+            "tgt":    sum_tgt / n,
+            "label":  sum_lbl / n,
+        }, global_epoch)
+        writer.add_scalars(f"{stage_name}/uw_weights", {
+            "action": w[0], "src": w[1], "tgt": w[2], "label": w[3],
+        }, global_epoch)
 
-    # ── Epoch 结束：打印平均 loss ─────────────────────────────────────────
-    n = max(num_batches, 1)
-    print(
-        f"  ▶ Epoch [{epoch+1:>3}/{TC['num_epochs']}] avg | "
-        f"total: {sum_loss/n:.4f}  "
-        f"act: {sum_loss_action/n:.4f}  "
-        f"src: {sum_loss_src/n:.4f}  "
-        f"tgt: {sum_loss_tgt/n:.4f}  "
-        f"label: {sum_loss_label/n:.4f}"
-    )
+        print(f"  ▶ [Ep {global_epoch}] {stage_name} avg | "
+              f"total:{avg:.4f} act:{sum_act/n:.4f}(w={w[0]:.2f}) "
+              f"src:{sum_src/n:.4f}(w={w[1]:.2f}) "
+              f"tgt:{sum_tgt/n:.4f}(w={w[2]:.2f}) "
+              f"label:{sum_lbl/n:.4f}(w={w[3]:.2f})")
+
+        if is_joint:
+            save_best(avg, f"ep{global_epoch}")
+
+writer.close()   # ← 训练结束关闭 writer

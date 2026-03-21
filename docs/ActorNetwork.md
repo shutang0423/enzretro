@@ -1,4 +1,4 @@
-
+# Actor Network
 
 为了对 Actor Network 的三个预测器（Action Type, Pointer, Label）进行预训练，我们需要将原本“一个反应对应一个完整的编辑序列”的数据，**展开（Unroll）为“单步决策”的马尔可夫决策过程（MDP）格式**。
 
