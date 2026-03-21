@@ -44,37 +44,50 @@ class ActionTypePredictor(nn.Module):
 
 
 class PointerNetwork(nn.Module):
-    """Step 2: 预测源节点(src)和目标节点(tgt)"""
     def __init__(self, hidden_dim, node_dim, num_actions, max_atoms):
         super().__init__()
         self.action_emb = nn.Embedding(num_actions, hidden_dim)
-        self.src_emb    = nn.Embedding(max_atoms,   hidden_dim)
+        self.src_emb    = nn.Embedding(max_atoms, hidden_dim)
         self.node_proj  = nn.Linear(node_dim, hidden_dim)
-        self.src_attn   = nn.MultiheadAttention(hidden_dim, num_heads=8, batch_first=True)
-        self.tgt_attn   = nn.MultiheadAttention(hidden_dim, num_heads=8, batch_first=True)
+        
+        # 替换 MultiheadAttention，使用简单的线性映射计算 Query 和 Key
+        self.q_proj_src = nn.Linear(hidden_dim, hidden_dim)
+        self.k_proj_src = nn.Linear(hidden_dim, hidden_dim)
+        self.q_proj_tgt = nn.Linear(hidden_dim, hidden_dim)
+        self.k_proj_tgt = nn.Linear(hidden_dim, hidden_dim)
 
     def forward(self, decoder_state, node_embeddings, action_type,
                 target_src_idx=None, node_mask=None):
         if action_type.dim() > 1:
             action_type = action_type.squeeze(-1)
 
-        nodes_proj = self.node_proj(node_embeddings)
-        act_emb    = self.action_emb(action_type)
+        nodes_proj = self.node_proj(node_embeddings) # [B, max_nodes, H]
+        act_emb    = self.action_emb(action_type)    # [B, H]
 
-        query_src  = (decoder_state + act_emb).unsqueeze(1)
-        _, src_w   = self.src_attn(query_src, nodes_proj, nodes_proj,
-                                   key_padding_mask=node_mask)
-        src_logits = src_w.squeeze(1)
+        # --- 预测 SRC Logits ---
+        query_src = self.q_proj_src(decoder_state + act_emb).unsqueeze(1) # [B, 1, H]
+        key_src   = self.k_proj_src(nodes_proj)                           # [B, max_nodes, H]
+        
+        # 手动点积计算 Logits: [B, 1, H] @ [B, H, max_nodes] -> [B, 1, max_nodes]
+        src_logits = torch.bmm(query_src, key_src.transpose(1, 2)).squeeze(1) # [B, max_nodes]
+        
+        # 处理 Mask：将 padding 节点的 logit 设为极小值
+        if node_mask is not None:
+            src_logits = src_logits.masked_fill(node_mask, -1e9)
 
-        src_idx = (target_src_idx if target_src_idx is not None
-                   else src_logits.argmax(dim=-1))
+        # 获取 src_idx (Teacher Forcing)
+        src_idx = target_src_idx if target_src_idx is not None else src_logits.argmax(dim=-1)
         src_idx = src_idx.clamp(0, self.src_emb.num_embeddings - 1)
+        src_e   = self.src_emb(src_idx)
 
-        src_e      = self.src_emb(src_idx)
-        query_tgt  = (decoder_state + act_emb + src_e).unsqueeze(1)
-        _, tgt_w   = self.tgt_attn(query_tgt, nodes_proj, nodes_proj,
-                                   key_padding_mask=node_mask)
-        tgt_logits = tgt_w.squeeze(1)
+        # --- 预测 TGT Logits ---
+        query_tgt = self.q_proj_tgt(decoder_state + act_emb + src_e).unsqueeze(1)
+        key_tgt   = self.k_proj_tgt(nodes_proj)
+        
+        tgt_logits = torch.bmm(query_tgt, key_tgt.transpose(1, 2)).squeeze(1)
+        
+        if node_mask is not None:
+            tgt_logits = tgt_logits.masked_fill(node_mask, -1e9)
 
         return src_logits, tgt_logits
 

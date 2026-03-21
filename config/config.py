@@ -1,5 +1,7 @@
 # config.py
-# 统一管理所有超参数，避免各文件中硬编码导致的越界
+# # 统一管理所有超参数，避免各文件中硬编码导致的越界
+from datetime import datetime
+current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
 
 MODEL_CONFIG = {
     # ── 图编码器 ──────────────────────────────────────
@@ -27,13 +29,13 @@ MODEL_CONFIG = {
 TRAIN_CONFIG = {
     "batch_size":  64,
     "lr":          1e-4,
-    "num_epochs":  10,
+    "num_epochs":  100,
 }
 
 PATH_CONFIG = {
     "vocab_file":   "tokenizer/vocab.txt",
     "train_data":   "dataset/uspto50k/pretrained/uspto50k_train_output.json",
     "test_data":    "dataset/uspto50k/pretrained/uspto50k_test_output.json",
-    "ckpt_path":    "ckpt/best_model.pt",
-    "log_dir":      "ckpt/pretrain",
+    "log_dir":      f"ckpt/{current_time}",
+    "ckpt_path":    f"ckpt/{current_time}/best_model.pt",
 }

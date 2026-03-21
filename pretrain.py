@@ -40,20 +40,31 @@ class UncertaintyWeighting(nn.Module):
     def weights(self):
         return torch.exp(-self.log_sigma).detach().cpu().tolist()
 
-
 # ══════════════════════════════════════════════════════════════════════════
 #  分阶段课程训练配置
 # ══════════════════════════════════════════════════════════════════════════
 STAGES = [
     {"name": "Stage1-Action",  "epochs": TC.get("stage1_epochs", 10),
      "tasks": ["action"],           "freeze": ["pointer_network", "label_decoder"]},
-    {"name": "Stage2-Pointer", "epochs": TC.get("stage2_epochs", 15),
+    {"name": "Stage2-Pointer", "epochs": TC.get("stage2_epochs", 30),
      "tasks": ["src", "tgt"],       "freeze": ["action_predictor", "label_decoder"]},
-    {"name": "Stage3-Label",   "epochs": TC.get("stage3_epochs", 15),
+    {"name": "Stage3-Label",   "epochs": TC.get("stage3_epochs", 30),
      "tasks": ["label"],            "freeze": ["action_predictor", "pointer_network"]},
     {"name": "Stage4-Joint",   "epochs": TC.get("stage4_epochs", 60),
      "tasks": ["action", "src", "tgt", "label"], "freeze": []},
 ]
+
+# ══════════════════════════════════════════════════════════════════════════
+#  直接进行多任务联合训练配置
+# ══════════════════════════════════════════════════════════════════════════
+# STAGES = [
+#     {
+#         "name": "Stage-Joint-All", 
+#         "epochs": TC.get("stage4_epochs", 100),  # 建议适当增加 Epoch 数量
+#         "tasks": ["action", "src", "tgt", "label"], 
+#         "freeze": []  # 不冻结任何模块，全参数更新
+#     }
+# ]
 
 
 def set_freeze(model, freeze_modules):
