@@ -35,6 +35,7 @@ TRAIN_CONFIG = {
 PATH_CONFIG = {
     "vocab_file":   "tokenizer/vocab.txt",
     "train_data":   "dataset/uspto50k/pretrained/uspto50k_train_output.json",
+    "val_data":     "dataset/uspto50k/pretrained/uspto50k_valid_output.json",
     "test_data":    "dataset/uspto50k/pretrained/uspto50k_test_output.json",
     "log_dir":      f"ckpt/{current_time}",
     "ckpt_path":    f"ckpt/{current_time}/best_model.pt",
