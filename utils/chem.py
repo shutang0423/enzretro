@@ -12,10 +12,99 @@ from rdkit.Chem import AllChem
 from rdkit.Chem import rdChemReactions
 from rdkit.Chem import Mol, RWMol, rdchem
 from rdkit.Chem import MACCSkeys
+from rdkit.Chem import Descriptors
 from rdkit import Chem, DataStructs 
 
 MAX_BONDS = {'C': 4, 'N': 3, 'O': 2, 'Br': 1,
              'Cl': 1, 'F': 1, 'I': 1, 'Li': 1, 'Na': 1, 'K': 1}
+
+# ── 原子特征定义 (共39维) ──────────────────────────────────────
+ATOM_TYPES = ['C','N','O','S','F','Si','P','Cl','Br','Mg','Na','Ca',
+              'Fe','As','Al','I','B','V','K','Tl','Yb','Sb','Sn',
+              'Ag','Pd','Co','Se','Ti','Zn','H','Li','Ge','Cu','Au',
+              'Ni','Cd','In','Mn','Zr','Cr','Pt','Hg','Pb','<unk>']
+HYBRIDIZATION = [
+    Chem.rdchem.HybridizationType.SP,
+    Chem.rdchem.HybridizationType.SP2,
+    Chem.rdchem.HybridizationType.SP3,
+    Chem.rdchem.HybridizationType.SP3D,
+    Chem.rdchem.HybridizationType.SP3D2,
+]
+BOND_TYPES = [
+    Chem.rdchem.BondType.SINGLE,
+    Chem.rdchem.BondType.DOUBLE,
+    Chem.rdchem.BondType.TRIPLE,
+    Chem.rdchem.BondType.AROMATIC,
+]
+
+
+def one_hot(val, choices: list) -> list:
+    return [1 if val == c else 0 for c in choices] + [0 if val in choices else 1]
+
+
+def atom_features(atom) -> list:
+    """提取单个原子特征 (39维)"""
+    return (
+        one_hot(atom.GetSymbol(), ATOM_TYPES[:-1])          # 44维 → 截断到43+1
+        + one_hot(atom.GetDegree(), [0,1,2,3,4,5])          # 7维
+        + one_hot(atom.GetTotalNumHs(), [0,1,2,3,4])        # 6维
+        + one_hot(atom.GetImplicitValence(), [0,1,2,3,4,5]) # 7维
+        + one_hot(atom.GetHybridization(), HYBRIDIZATION)   # 6维
+        + [atom.GetIsAromatic()]                             # 1维
+        + [atom.GetFormalCharge()]                           # 1维
+        + [atom.IsInRing()]                                  # 1维
+    )
+    # 注意: 实际维度由上面累加决定，需与 node_in_dim 对齐
+    # 建议在 config 中设置 node_in_dim = get_atom_feat_dim()
+
+
+def get_atom_feat_dim() -> int:
+    """动态计算原子特征维度"""
+    from rdkit import Chem
+    mol = Chem.MolFromSmiles("C")
+    return len(atom_features(mol.GetAtomWithIdx(0)))
+
+
+def bond_features(bond) -> list:
+    """提取键特征 (6维)"""
+    bt = bond.GetBondType()
+    return (
+        one_hot(bt, BOND_TYPES[:-1])   # 4维
+        + [bond.GetIsConjugated()]      # 1维
+        + [bond.IsInRing()]             # 1维
+    )
+
+def smiles_to_pyg(smiles: str, with_hydrogen: bool = False) -> Optional[Data]:
+    """SMILES → PyG Data
+
+    Returns None if SMILES is invalid.
+    """
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return None
+    if with_hydrogen:
+        mol = Chem.AddHs(mol)
+
+    # 原子特征
+    atom_feats = [atom_features(a) for a in mol.GetAtoms()]
+    x = torch.tensor(atom_feats, dtype=torch.float)  # [N, node_in_dim]
+
+    # 键 (双向)
+    if mol.GetNumBonds() == 0:
+        edge_index = torch.zeros((2, 0), dtype=torch.long)
+        edge_attr  = torch.zeros((0, 6), dtype=torch.float)
+    else:
+        src, dst, eattr = [], [], []
+        for bond in mol.GetBonds():
+            i, j = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+            bf = bond_features(bond)
+            src += [i, j]; dst += [j, i]
+            eattr += [bf, bf]
+        edge_index = torch.tensor([src, dst], dtype=torch.long)
+        edge_attr  = torch.tensor(eattr, dtype=torch.float)
+
+    return Data(x=x, edge_index=edge_index, edge_attr=edge_attr,
+                num_nodes=mol.GetNumAtoms())
 
 def make_sentence_to_string(rules):
     rules_data = list(map(lambda rule: ", ".join([" ".join(r) for r in eval(rule)]), rules))
