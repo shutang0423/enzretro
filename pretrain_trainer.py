@@ -15,6 +15,15 @@ from torch.utils.tensorboard.writer import SummaryWriter
 
 from models.actor import ActorNetwork
 
+logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        handlers=[
+            logging.StreamHandler(),                        # stdout → pre.log
+            logging.FileHandler("pretrain.log", mode="a"), # 独立日志文件
+        ],
+        force=True,
+    )
 logger = logging.getLogger(__name__)
 
 
@@ -283,10 +292,10 @@ if __name__ == "__main__":
 
     tokenizer  = LabelTokenizer(vocab_file=str(cfg.path.VOCAB_FILE))
     from data.dataset import build_dataloader
-    train_dataloader = build_dataloader(json_path=str(cfg.path.RL_TEST_DATA_FILE), tokenizer=tokenizer,
+    train_dataloader = build_dataloader(json_path=str(cfg.path.RL_TRAIN_DATA_FILE), tokenizer=tokenizer,
                                         batch_size=cfg.model.BATCH_SIZE, shuffle=True, mode="pretrain")
     val_dataloader = build_dataloader(json_path=str(cfg.path.RL_VAL_DATA_FILE), tokenizer=tokenizer,
-                                        batch_size=cfg.model.BATCH_SIZE, shuffle=True, mode="pretrain")
+                                        batch_size=cfg.model.BATCH_SIZE, shuffle=False, mode="pretrain")
 
     pretrain_trainer = PretrainTrainer(actor, cfg, device)
     pretrain_trainer.fit(train_dataloader, val_dataloader)

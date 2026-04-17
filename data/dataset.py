@@ -106,6 +106,14 @@ class USPTO50KDataset(Dataset):
 
 
 # ── Collate ────────────────────────────────────────────────────
+class PretrainCollateFn:
+    def __init__(self, tokenizer, max_label_len: int = 64):
+        self.tokenizer     = tokenizer
+        self.max_label_len = max_label_len
+
+    def __call__(self, batch):
+        return collate_pretrain(batch, self.tokenizer, self.max_label_len)
+    
 def collate_pretrain(batch: List[Dict], tokenizer, max_label_len: int = 64):
     """预训练 collate_fn
 
@@ -173,9 +181,14 @@ def collate_rl(batch: List[Dict]):
 
 def build_dataloader(json_path: str, tokenizer,
                      batch_size: int = 32, shuffle: bool = True,
-                     mode: str = "pretrain") -> DataLoader:
+                     mode: str = "pretrain",
+                     max_label_len: int = 64, num_workers: int = 4) -> DataLoader:
     dataset = USPTO50KDataset(json_path, tokenizer)
-    fn = (lambda b: collate_pretrain(b, tokenizer)) if mode == "pretrain" else collate_rl
+    # fn = (lambda b: collate_pretrain(b, tokenizer)) if mode == "pretrain" else collate_rl
+    if mode == "pretrain":
+        collate_fn = PretrainCollateFn(tokenizer, max_label_len)  
+    else:
+        collate_fn = collate_rl
     return DataLoader(dataset, batch_size=batch_size,
-                      shuffle=shuffle, collate_fn=fn,
+                      shuffle=shuffle, collate_fn=collate_fn,
                       num_workers=4, pin_memory=True)
