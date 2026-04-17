@@ -3,16 +3,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import GATConv, global_mean_pool
 from torch_geometric.utils import to_dense_batch
-from config.config import MODEL_CONFIG as C
+# from config.config import MODEL_CONFIG as C
 
 
 class GraphEncoder(nn.Module):
     """产物图编码器 (基于 GAT)"""
-    def __init__(self, node_in_dim, hidden_dim, num_layers=4):
+    def __init__(self, node_in_dim, hidden_dim, num_layers=4, num_heads=4):
         super().__init__()
         self.node_proj = nn.Linear(node_in_dim, hidden_dim)
         self.convs = nn.ModuleList([
-            GATConv(hidden_dim, hidden_dim, heads=4, concat=False)
+            GATConv(hidden_dim, hidden_dim, num_heads, concat=False)
             for _ in range(num_layers)
         ])
         self.graph_pool = nn.Sequential(

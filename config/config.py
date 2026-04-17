@@ -1,7 +1,12 @@
 # config.py
-# # 统一管理所有超参数，避免各文件中硬编码导致的越界
+import os
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
+from pathlib import Path
+import numpy as np
 from datetime import datetime
 current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+from utils.chem import get_atom_feat_dim
 
 # ── 动作类型定义 (与数据集 action_type 字段对齐) ─────────────
 ACTION_TYPES = [
@@ -19,92 +24,120 @@ TERMINATE_ACTION_ID = ACTION_TO_ID["Terminate"]   # 6
 NUM_ACTIONS = len(ACTION_TYPES)                   # 7
 PAD_ACTION_ID = NUM_ACTIONS                       # 7 (用于 padding)
 
-PATH_CONFIG = {
-    "vocab_file":   "tokenizer/vocab.txt",
-    "train_data":   "dataset/uspto50k/pretrained/uspto50k_train_output.json",
-    "val_data":     "dataset/uspto50k/pretrained/uspto50k_valid_output.json",
-    "test_data":    "dataset/uspto50k/pretrained/uspto50k_test_output.json",
-    "log_dir":      f"ckpt/{current_time}",
-    "ckpt_path":    f"ckpt/{current_time}/best_model.pt",
-}
+
+@dataclass
+class PathConfig:
+    ROOT_DIR: Path = Path(".")
+    DATA_DIR: Path = Path("dataset/uspto50k/")
+
+    # 预训练数据集
+    PRETRAIN_DATA_DIR: Path = Path("dataset/uspto50k/pretrained/")
+    PRETRAIN_TRAIN_DATA_FILE: Path = PRETRAIN_DATA_DIR / "uspto50k_train_output.json"
+    PRETRAIN_VAL_DATA_FILE: Path = PRETRAIN_DATA_DIR / "uspto50k_valid_output.json"
+    PRETRAIN_TEST_DATA_FILE: Path = PRETRAIN_DATA_DIR / "uspto50k_test_output.json"
+
+    # RL 数据集
+    RL_DATA_DIR: Path = Path("dataset/uspto50k/processed/")
+    RL_TRAIN_DATA_FILE: Path = RL_DATA_DIR / "uspto50k_train_output.json"
+    RL_VAL_DATA_FILE: Path = RL_DATA_DIR / "uspto50k_valid_output.json"
+    RL_TEST_DATA_FILE: Path = RL_DATA_DIR / "uspto50k_test_output.json"
+
+    # 分词器
+    TOKENIZER_DIR: Path = Path("tokenizer/")
+    VOCAB_FILE: Path = TOKENIZER_DIR / "vocab.txt"
+
+    # 模型检查点
+    CKPT_DIR: Path = Path(f"ckpt/")
+    LOG_DIR: Path = CKPT_DIR / "log"
+    TB_DIR: Path = CKPT_DIR / "tensorboard"
+    CKPT_BEST_MODEL_FILE: Path = CKPT_DIR / "best_model.pt"
+    CKPT_LAST_MODEL_FILE: Path = CKPT_DIR / "actor_last.pt"
+    
+    def __post_init__(self):
+        """创建必要的目录"""
+        for attr_name in dir(self):
+            attr = getattr(self, attr_name)
+            if isinstance(attr, Path) and attr_name.endswith('_DIR'):
+                attr.mkdir(parents=True, exist_ok=True)
 
 
-MODEL_CONFIG = {
+
+@dataclass
+class ModelConfig:
+    BATCH_SIZE: int = 16
+
+    # 分词器
+    VOCAB_SIZE: int = 137
+
     # 图编码器
-    "node_in_dim":  39,          # RDKit 原子特征维度 (可调)
-    "node_dim":     256,         # GAT 内部维度
-    "hidden_dim":   512,         # 解码器/策略网络维度
-    "gat_layers":   4,
-    "gat_heads":    4,
+    NODE_IN_DIM: int = get_atom_feat_dim()       # RDKit 原子特征维度 (可调)
+    NODE_DIM: int = 256        # GAT 内部维度
+    HIDDEN_DIM: int = 512        # 解码器/策略网络维度
+    GAT_LAYERS: int = 4
+    GAT_HEADS: int = 4
 
     # 动作空间
-    "num_actions":  NUM_ACTIONS,
-    "pad_action_id": PAD_ACTION_ID,
+    NUM_ACTIONS: int = NUM_ACTIONS
+    PAD_ACTION_ID: int = PAD_ACTION_ID
 
     # 指针网络
-    "max_atoms":    100,         # USPTO50K 最大原子数约50，留余量
+    MAX_ATOMS: int = 100         # USPTO50K 最大原子数约50，留余量
 
     # 标签解码器
-    "max_pos_enc":  128,         # label序列最大长度
+    MAX_POS_ENC: int = 128       # label序列最大长度
 
     # State Tracker
-    "gru_layers":   2,
-}
+    GRU_LAYERS: int = 2
 
+    # Pretrain 配置
+    W_ACTION:  float = 1.0
+    W_POINTER: float = 1.0
+    W_LABEL:   float = 0.5
 
-# ── RL 训练配置 ───────────────────────────────────────────────
-RL_CONFIG = {
-    # PPO 超参
-    "clip_eps":           0.2,
-    "ppo_epochs":         4,
-    "mini_batch_size":    32,
-    "gamma":              0.99,
-    "gae_lambda":         0.95,
-    "entropy_coef":       0.01,
-    "value_loss_coef":    0.5,
-    "max_grad_norm":      0.5,
+    MAX_GRAD_NORM: float = 0.5
 
+# ════════════════════════════════════════════════════════════
+#  预训练配置
+# ════════════════════════════════════════════════════════════
+@dataclass
+class PretrainConfig:
     # 优化器
-    "lr_actor":           1e-5,   # LoRA 学习率要小
-    "lr_critic":          3e-4,
+    lr:              float = 1e-4
+    weight_decay:    float = 1e-4
+    max_grad_norm:   float = 1.0
 
-    # KL 约束 (防止偏离预训练策略)
-    "kl_coef":            0.1,
-    "kl_target":          0.01,
+    # 调度器
+    total_epochs:    int   = 50
+    warmup_epochs:   int   = 3
 
-    # LoRA
-    "use_lora":           True,
-    "lora_rank":          8,
-    "lora_alpha":         16.0,
-    "freeze_encoder":     True,
+    # DataLoader
+    batch_size:      int   = 32
+    num_workers:     int   = 4
+    pin_memory:      bool  = True
 
-    # 训练流程
-    "total_updates":      500,
-    "episodes_per_update": 64,
-    "max_steps_per_episode": 10,  # USPTO50K 平均3-5步，上限10
+    # 损失权重
+    w_action:        float = 1.0
+    w_pointer:       float = 1.0
+    w_label:         float = 0.5
+    label_pad_id:    int   = 0
 
-    # 动作 padding
-    "pad_action_id":      PAD_ACTION_ID,
-}
+    # 断点续训
+    resume:          bool  = False   # 是否自动加载最近 checkpoint
+    save_every:      int   = 5      # 每N个epoch保存一次
 
-# ── 奖励配置 ──────────────────────────────────────────────────
-REWARD_CONFIG = {
-    "step_penalty":            -0.02,
-    "invalid_action_penalty":  -0.5,
-    "correct_action_bonus":     0.5,
-    "wrong_action_penalty":    -0.2,
-    "failure_penalty":         -5.0,
-    "success_reward":          10.0,
-    "early_terminate_penalty": -3.0,
-    "correct_terminate_bonus":  2.0,
-}
+    # 早停
+    early_stop_patience: int = 10
 
-# ── 标签特殊 token ────────────────────────────────────────────
-LABEL_SPECIAL = {
-    "NONE_TOKEN":      "NONE",
-    "TERMINATE_TOKEN": "Terminate",
-    "BOS_TOKEN":       "<bos>",
-    "EOS_TOKEN":       "<eos>",
-    "PAD_TOKEN":       "<pad>",
-    "UNK_TOKEN":       "<unk>",
-}
+
+# ═══════════════════════════════════════════════════════════
+# 全局配置实例
+# ═══════════════════════════════════════════════════════════
+@dataclass
+class Config:
+    path = PathConfig()
+    model = ModelConfig()
+    pretrain = PretrainConfig()
+    
+# 创建全局配置实例
+config = Config()
+

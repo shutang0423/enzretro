@@ -12,11 +12,10 @@ import json
 import torch
 from torch.utils.data import Dataset, DataLoader
 from torch_geometric.data import Data, Batch
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Optional
 
-from data.mol_utils import smiles_to_pyg
-from config.config import ACTION_TO_ID, TERMINATE_ACTION_ID, MODEL_CONFIG
-
+from utils.chem import smiles_to_pyg
+from config.config import ACTION_TO_ID, TERMINATE_ACTION_ID
 
 # ── 特殊索引常量 ───────────────────────────────────────────────
 INVALID_IDX = 0   # Terminate 时 src/tgt=-1 → 映射为 0 (不参与 loss)
@@ -96,6 +95,7 @@ class USPTO50KDataset(Dataset):
             "edits":       processed_edits,
             "num_edits":   len(processed_edits),
             "product_smi": product_smi,
+            "reactant_smi": item["output"]["reactant_smi"],
         }
 
     def __len__(self):
@@ -107,62 +107,58 @@ class USPTO50KDataset(Dataset):
 
 # ── Collate ────────────────────────────────────────────────────
 def collate_pretrain(batch: List[Dict], tokenizer, max_label_len: int = 64):
-    """预训练 DataLoader 的 collate_fn
+    """预训练 collate_fn
 
-    将一个 batch 的样本展开为逐步的训练数据。
-    每一步作为独立训练样本 (Teacher Forcing)。
-
-    Returns:
-        pyg_batch      : PyG Batch (所有样本的图)
-        target_actions : [total_steps]  LongTensor
-        target_srcs    : [total_steps]  LongTensor
-        target_tgts    : [total_steps]  LongTensor
-        decoder_inputs : [total_steps, max_label_len]  LongTensor (BOS + label)
-        decoder_targets: [total_steps, max_label_len]  LongTensor (label + EOS)
-        src_valid_mask : [total_steps]  BoolTensor
-        tgt_valid_mask : [total_steps]  BoolTensor
-        step_to_sample : [total_steps]  int (每步属于哪个样本)
+    把 batch 内所有样本的所有步骤展平为独立训练数据。
+    新增返回 step_to_sample_tensor，供 actor.forward 做 index select。
     """
     pad_id = tokenizer.pad_token_id
     bos_id = tokenizer.bos_token_id
     eos_id = tokenizer.eos_token_id
 
-    graphs, actions, srcs, tgts = [], [], [], []
-    dec_inputs, dec_targets = [], []
-    src_valids, tgt_valids, step_to_sample = [], [], []
+    graphs        = []
+    actions       = []
+    srcs          = []
+    tgts          = []
+    dec_inputs    = []
+    dec_targets   = []
+    src_valids    = []
+    tgt_valids    = []
+    step_to_sample = []          # ← 每步对应的图索引
 
     for sample_idx, sample in enumerate(batch):
         graphs.append(sample["graph"])
+
         for edit in sample["edits"]:
             actions.append(edit["action_id"])
             srcs.append(edit["src_idx"])
             tgts.append(edit["tgt_idx"])
             src_valids.append(edit["src_valid"])
             tgt_valids.append(edit["tgt_valid"])
-            step_to_sample.append(sample_idx)
+            step_to_sample.append(sample_idx)   # ← 记录归属
 
-            # Teacher Forcing: input=[BOS, t1, t2,...], target=[t1, t2,..., EOS]
-            lids = edit["label_ids"]
-            inp = [bos_id] + lids
-            tgt_seq = lids + [eos_id]
-            # pad 到 max_label_len+1
-            L = max_label_len + 1
-            inp     = inp[:L]     + [pad_id] * max(0, L - len(inp))
-            tgt_seq = tgt_seq[:L] + [pad_id] * max(0, L - len(tgt_seq))
+            # Teacher Forcing 序列构建
+            lids    = edit["label_ids"]
+            L       = max_label_len + 1
+            inp     = ([bos_id] + lids)[:L]
+            tgt_seq = (lids + [eos_id])[:L]
+            inp     = inp     + [pad_id] * max(0, L - len(inp))
+            tgt_seq = tgt_seq + [pad_id] * max(0, L - len(tgt_seq))
             dec_inputs.append(inp)
             dec_targets.append(tgt_seq)
 
     pyg_batch = Batch.from_data_list(graphs)
+
     return {
-        "pyg_batch":       pyg_batch,
-        "target_actions":  torch.tensor(actions,    dtype=torch.long),
-        "target_srcs":     torch.tensor(srcs,       dtype=torch.long),
-        "target_tgts":     torch.tensor(tgts,       dtype=torch.long),
-        "decoder_inputs":  torch.tensor(dec_inputs, dtype=torch.long),
-        "decoder_targets": torch.tensor(dec_targets,dtype=torch.long),
-        "src_valid_mask":  torch.tensor(src_valids, dtype=torch.bool),
-        "tgt_valid_mask":  torch.tensor(tgt_valids, dtype=torch.bool),
-        "step_to_sample":  step_to_sample,
+        "pyg_batch":            pyg_batch,
+        "target_actions":       torch.tensor(actions,     dtype=torch.long),
+        "target_srcs":          torch.tensor(srcs,        dtype=torch.long),
+        "target_tgts":          torch.tensor(tgts,        dtype=torch.long),
+        "decoder_inputs":       torch.tensor(dec_inputs,  dtype=torch.long),
+        "decoder_targets":      torch.tensor(dec_targets, dtype=torch.long),
+        "src_valid_mask":       torch.tensor(src_valids,  dtype=torch.bool),
+        "tgt_valid_mask":       torch.tensor(tgt_valids,  dtype=torch.bool),
+        "step_to_sample":       torch.tensor(step_to_sample, dtype=torch.long),  # ← 新增
     }
 
 

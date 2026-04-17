@@ -136,7 +136,7 @@ class PointerNetwork(nn.Module):
         if node_mask is not None:
             tgt_logits = tgt_logits.masked_fill(node_mask, -1e4)
 
-    return src_logits, tgt_logits
+        return src_logits, tgt_logits
 
 class LabelDecoder(nn.Module):
     """Transformer Decoder 生成 label token 序列"""
@@ -170,14 +170,19 @@ class LabelDecoder(nn.Module):
 class ActorNetwork(nn.Module):
     """完整策略网络 (预训练 + LoRA 微调)"""
 
-    def __init__(self, vocab_size: int, cfg: dict):
+    def __init__(self, vocab_size: int, 
+                 node_in_dim: int, hidden_dim: int,
+                 num_actions: int, max_atoms: int,
+                 max_pos_enc: int,
+                 gat_heads: int,
+                 gat_layers: int):
         super().__init__()
-        nd, hd = cfg["node_dim"], cfg["hidden_dim"]
-        na, ma = cfg["num_actions"], cfg["max_atoms"]
-        mpe = cfg["max_pos_enc"]
+        nd, hd = node_in_dim, hidden_dim
+        na, ma = num_actions, max_atoms
+        mpe = max_pos_enc
 
-        self.graph_encoder    = GraphEncoder(cfg["node_in_dim"], nd,
-                                             cfg["gat_layers"], cfg["gat_heads"])
+        self.graph_encoder    = GraphEncoder(node_in_dim, nd,
+                                             gat_layers, gat_heads)
         self.state_proj       = nn.Linear(nd, hd)
         self.action_predictor = ActionTypePredictor(hd, na)
         self.pointer_network  = PointerNetwork(hd, nd, na, ma)
@@ -189,17 +194,65 @@ class ActorNetwork(nn.Module):
         dense_nodes, node_mask = to_dense_batch(node_emb, batch)
         return dense_nodes, ~node_mask, self.state_proj(graph_emb)
 
+    # def forward(self, x, edge_index, batch,
+    #             target_action, target_src, decoder_input_seq,
+    #             decoder_state=None):
+    #     """预训练 forward (teacher forcing)"""
+    #     dense_nodes, pad_mask, graph_state = self.encode_graph(x, edge_index, batch)
+    #     state = decoder_state if decoder_state is not None else graph_state
+    #     action_logits = self.action_predictor(state)
+    #     src_logits, tgt_logits = self.pointer_network(
+    #         state, dense_nodes, target_action, target_src, pad_mask
+    #     )
+    #     label_logits = self.label_decoder(state, target_action, decoder_input_seq)
+    #     return action_logits, src_logits, tgt_logits, label_logits
     def forward(self, x, edge_index, batch,
-                target_action, target_src, decoder_input_seq,
-                decoder_state=None):
-        """预训练 forward (teacher forcing)"""
+            target_action, target_src, decoder_input_seq,
+            step_to_sample=None,          # ← 新增参数
+            decoder_state=None,
+            src_valid=None, tgt_valid=None):
+        """预训练 forward (teacher forcing)
+
+        Args:
+            x, edge_index, batch : PyG 图数据  (B_graphs 个图)
+            target_action        : [N_steps]   每步的目标动作
+            target_src           : [N_steps]   每步的目标源节点
+            decoder_input_seq    : [N_steps, L] 每步的 label 输入序列
+            step_to_sample       : [N_steps]   每步属于哪个图(0-based index)
+                                None 时假设 N_steps == B_graphs (单步模式)
+            src_valid / tgt_valid: [N_steps]   BoolTensor
+        """
+        # ── Step1: 编码图 → [B_graphs, ...] ──────────────────────
         dense_nodes, pad_mask, graph_state = self.encode_graph(x, edge_index, batch)
-        state = decoder_state if decoder_state is not None else graph_state
-        action_logits = self.action_predictor(state)
+        # graph_state : [B_graphs, hidden_dim]
+        # dense_nodes : [B_graphs, N_max, node_dim]
+        # pad_mask    : [B_graphs, N_max]
+
+        # ── Step2: 按 step_to_sample 扩展到 [N_steps, ...] ───────
+        if step_to_sample is not None:
+            # step_to_sample: [N_steps] LongTensor，值域 [0, B_graphs)
+            state       = graph_state[step_to_sample]        # [N_steps, hidden_dim]
+            dense_nodes = dense_nodes[step_to_sample]        # [N_steps, N_max, node_dim]
+            pad_mask    = pad_mask[step_to_sample]           # [N_steps, N_max]
+        else:
+            # 单步模式：N_steps == B_graphs，直接使用
+            state = graph_state if decoder_state is None else decoder_state
+
+        # ── Step3: 三个预测头 ─────────────────────────────────────
+        action_logits = self.action_predictor(state)         # [N_steps, num_actions]
+
         src_logits, tgt_logits = self.pointer_network(
-            state, dense_nodes, target_action, target_src, pad_mask
-        )
-        label_logits = self.label_decoder(state, target_action, decoder_input_seq)
+            state, dense_nodes, target_action,
+            src_idx=target_src,
+            node_mask=pad_mask,
+            src_valid=src_valid,
+            tgt_valid=tgt_valid,
+        )                                                    # [N_steps, N_max]
+
+        label_logits = self.label_decoder(
+            state, target_action, decoder_input_seq
+        )                                                    # [N_steps, L, vocab]
+
         return action_logits, src_logits, tgt_logits, label_logits
 
     def inject_lora(self, rank: int = 8, alpha: float = 16.0):

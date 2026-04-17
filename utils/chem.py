@@ -5,7 +5,7 @@ import pandas as pd
 from PIL import Image
 from io import BytesIO
 from multiprocessing import Process, Queue
-from typing import Dict, Tuple, List, Union
+from typing import Dict, Tuple, List, Union, Optional
 from rdkit import Chem
 from rdkit.Chem import Draw
 from rdkit.Chem import AllChem
@@ -14,6 +14,8 @@ from rdkit.Chem import Mol, RWMol, rdchem
 from rdkit.Chem import MACCSkeys
 from rdkit.Chem import Descriptors
 from rdkit import Chem, DataStructs 
+import torch
+from torch_geometric.data import Data
 
 MAX_BONDS = {'C': 4, 'N': 3, 'O': 2, 'Br': 1,
              'Cl': 1, 'F': 1, 'I': 1, 'Li': 1, 'Na': 1, 'K': 1}
