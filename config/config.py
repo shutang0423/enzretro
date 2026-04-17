@@ -13,9 +13,9 @@ ACTION_TYPES = [
     "DeleteBond",      # 0
     "ChangeBond",      # 1
     "ChangeAtom",      # 2
-    "AddAtom",         # 3
+    # "AddAtom",         # 3
     "AttachGroup",     # 4
-    "AddRing",         # 5
+    # "AddRing",         # 5
     "Terminate",       # 6
 ]
 ACTION_TO_ID = {a: i for i, a in enumerate(ACTION_TYPES)}
@@ -25,45 +25,10 @@ NUM_ACTIONS = len(ACTION_TYPES)                   # 7
 PAD_ACTION_ID = NUM_ACTIONS                       # 7 (用于 padding)
 
 
-# @dataclass
-# class PathConfig:
-#     ROOT_DIR: Path = Path(".")
-#     DATA_DIR: Path = Path("dataset/uspto50k/")
-
-#     # 预训练数据集
-#     PRETRAIN_DATA_DIR: Path = Path("dataset/uspto50k/pretrained/")
-#     PRETRAIN_TRAIN_DATA_FILE: Path = PRETRAIN_DATA_DIR / "uspto50k_train_output.json"
-#     PRETRAIN_VAL_DATA_FILE: Path = PRETRAIN_DATA_DIR / "uspto50k_valid_output.json"
-#     PRETRAIN_TEST_DATA_FILE: Path = PRETRAIN_DATA_DIR / "uspto50k_test_output.json"
-
-#     # RL 数据集
-#     RL_DATA_DIR: Path = Path("dataset/uspto50k/processed/")
-#     RL_TRAIN_DATA_FILE: Path = RL_DATA_DIR / "uspto50k_train_output.json"
-#     RL_VAL_DATA_FILE: Path = RL_DATA_DIR / "uspto50k_valid_output.json"
-#     RL_TEST_DATA_FILE: Path = RL_DATA_DIR / "uspto50k_test_output.json"
-
-#     # 分词器
-#     TOKENIZER_DIR: Path = Path("tokenizer/")
-#     VOCAB_FILE: Path = TOKENIZER_DIR / "vocab.txt"
-
-#     # 模型检查点
-#     CKPT_DIR: Path = Path(f"ckpt2/")
-#     LOG_DIR: Path = CKPT_DIR / "log"
-#     TB_DIR: Path = CKPT_DIR / "tensorboard"
-#     CKPT_BEST_MODEL_FILE: Path = CKPT_DIR / "best_model.pt"
-#     CKPT_LAST_MODEL_FILE: Path = CKPT_DIR / "actor_last.pt"
-    
-#     def __post_init__(self):
-#         """创建必要的目录"""
-#         for attr_name in dir(self):
-#             attr = getattr(self, attr_name)
-#             if isinstance(attr, Path) and attr_name.endswith('_DIR'):
-#                 attr.mkdir(parents=True, exist_ok=True)
-
 @dataclass
 class PathConfig:
     # ── 唯一需要手动传入的参数 ──────────────────────────────────
-    project_name: str = "pretrain2"
+    project_name: str = f"pretrain_{current_time}"
 
     # ── 固定根目录 ───────────────────────────────────────────────
     ROOT_DIR: Path = Path(".")
@@ -119,7 +84,7 @@ class PathConfig:
 
 @dataclass
 class ModelConfig:
-    BATCH_SIZE: int = 32
+    BATCH_SIZE: int = 64
 
     # 分词器
     VOCAB_SIZE: int = 137
@@ -162,7 +127,7 @@ class PretrainConfig:
     max_grad_norm:   float = 1.0
 
     # 调度器
-    total_epochs:    int   = 50
+    total_epochs:    int   = 100
     warmup_epochs:   int   = 3
 
     # DataLoader
@@ -177,7 +142,7 @@ class PretrainConfig:
     label_pad_id:    int   = 0
 
     # 断点续训
-    resume:          bool  = True   # 是否自动加载最近 checkpoint
+    resume:          bool  = False   # 是否自动加载最近 checkpoint
     save_every:      int   = 5      # 每N个epoch保存一次
 
     # 早停
