@@ -32,6 +32,29 @@
 
 ---
 
+后续强化学习中需要微调，是否把Actor 冻结 + LoRA 微调：保护预训练知识实现更好？
+
+✅ 推荐方案：LoRA + KL约束
+
+具体配置：
+  冻结：GraphEncoder（纯化学知识）
+  LoRA：StateTracker + 三大预测头（策略适应）
+  KL约束：β = 0.1~0.5（超参，需要调）
+  LoRA rank：r = 8~16（化学任务复杂度中等）
+  LoRA alpha：α = 16~32（通常 α = 2r）
+
+训练流程：
+  Phase 1: 监督预训练（当前已完成）
+  Phase 2: LoRA + PPO（冻结主干，只更新 LoRA 参数）
+  Phase 3: 可选 - 解冻部分层全参数微调（如效果不够）
+
+阶段	训练内容	可训练参数	保存内容
+Phase 1 监督预训练	全参数	全部	best_model.pt（全量）
+Phase 2 LoRA+PPO	LoRA增量 + Critic	LoRA(~2%) + Critic	lora_best.pt + critic_best.pt
+Phase 3（可选）全参微调	解冻部分层	LoRA merge + 指定层	finetuned_model.pt（全量）
+
+
+---
 ## 二、Module 1: Graph Encoder（图编码器）
 
 ### 2.1 功能定位

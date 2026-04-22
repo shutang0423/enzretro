@@ -1,260 +1,304 @@
+"""
+ssr_graph_pretrain_dataset.py —— 预训练图数据集
+
+修改说明（相对原始版本）：
+  1. 补全历史序列的完整 4 字段：
+       history_actions    [T]
+       history_src_idxs   [T]    ← 新增
+       history_tgt_idxs   [T]    ← 新增
+       history_label_seqs [T, L] ← 新增
+  2. 修正 target_label / history_actions 多余的一维（去掉外层 []）
+  3. smiles_to_graph 统一输出 NODE_FEATURE_DIM=79 维，不再手动 pad 到 128
+  4. 覆写 StepData.__inc__ 防止原子索引被 PyG DataLoader 自动 offset
+  5. 覆写 StepData.__cat_dim__ 确保 [T,L] 张量在正确维度拼接
+
+数据流：
+  JSON record
+    product_smi  → smiles_to_graph() → x [N,79], edge_index [2,E]
+    history[]    → _build_history()  → history_actions    [T]
+                                        history_src_idxs   [T]
+                                        history_tgt_idxs   [T]
+                                        history_label_seqs [T, L]
+    target_*     → _build_target()   → target_action [1]
+                                        target_src    [1]
+                                        target_tgt    [1]
+                                        target_label  [L]
+    → StepData（PyG Data 子类）
+"""
+
+from __future__ import annotations
+import json
+from pathlib import Path
+
 import torch
-import json 
+from torch_geometric.data import Data
 from rdkit import Chem
 from rdkit.Chem import rdchem
-from torch_geometric.data import Data
-from torch_geometric.loader import DataLoader
 
-# ══════════════════════════════════════════════════════════════════
-#  特征候选列表
-# ══════════════════════════════════════════════════════════════════
+from config.config import MODEL_CFG, PAD_ACTION_ID
+from utils.chem import atom_features, bond_features, get_atom_feat_dim, get_edge_feat_dim, smiles_to_graph
 
-PERMITTED_SYMBOLS = [
-    'C','N','O','S','F','Si','P','Cl','Br','Mg','Na','Ca','Fe',
-    'As','Al','I','B','V','K','Tl','Yb','Sb','Sn','Ag','Pd','Co',
-    'Se','Ti','Zn','H','Li','Ge','Cu','Au','Ni','Cd','In','Mn',
-    'Zr','Cr','Pt','Hg','Pb',
-]  # 43种，+UNK = 44，one_hot_encoding 会再+1 = 45 ✅
+# ══════════════════════════════════════════════════════════════════════
+#  历史序列构建（完整 4 字段）
+# ══════════════════════════════════════════════════════════════════════
 
-PERMITTED_DEGREES       = [0, 1, 2, 3, 4, 5]          # +UNK = 7
-PERMITTED_FORMAL_CHRGS  = [-3, -2, -1, 0, 1, 2, 3]    # +UNK = 8
-PERMITTED_NUM_HS        = [0, 1, 2, 3, 4]              # +UNK = 6
-PERMITTED_HYBRIDIZATION = [
-    rdchem.HybridizationType.SP,
-    rdchem.HybridizationType.SP2,
-    rdchem.HybridizationType.SP3,
-    rdchem.HybridizationType.SP3D,
-    rdchem.HybridizationType.SP3D2,
-]  # +UNK = 6
-PERMITTED_CHIRAL = [
-    rdchem.ChiralType.CHI_UNSPECIFIED,
-    rdchem.ChiralType.CHI_TETRAHEDRAL_CW,
-    rdchem.ChiralType.CHI_TETRAHEDRAL_CCW,
-    rdchem.ChiralType.CHI_OTHER,
-]  # +UNK = 5
-
-PERMITTED_BOND_TYPES = [
-    rdchem.BondType.SINGLE,
-    rdchem.BondType.DOUBLE,
-    rdchem.BondType.TRIPLE,
-    rdchem.BondType.AROMATIC,
-]  # +UNK = 5
-PERMITTED_BOND_STEREO = [
-    rdchem.BondStereo.STEREONONE,
-    rdchem.BondStereo.STEREOANY,
-    rdchem.BondStereo.STEREOZ,
-    rdchem.BondStereo.STEREOE,
-]  # +UNK = 5
-
-# 供外部 model/config 使用
-NODE_FEATURE_DIM = 79
-EDGE_FEATURE_DIM = 12
-
-# ══════════════════════════════════════════════════════════════════
-#  工具函数
-# ══════════════════════════════════════════════════════════════════
-
-def one_hot_encoding(value, choices: list) -> list:
+def _encode_label(label_str: str, tokenizer, max_len: int) -> torch.Tensor:
     """
-    One-Hot 编码，不在 choices 中时最后一位(UNK)置1。
-    输出长度 = len(choices) + 1
+    将 label 字符串编码为定长 token id 序列
+    兼容原始代码的中括号补全逻辑
+    返回: [max_len] long
     """
-    encoding = [0] * (len(choices) + 1)
-    if value in choices:
-        encoding[choices.index(value)] = 1
-    else:
-        encoding[-1] = 1
-    return encoding
+    # 兼容性补丁：补全中括号
+    if label_str in {"NONE", "SINGLE", "DOUBLE", "TRIPLE", "AROMATIC", "CW", "CCW"}:
+        label_str = f"[{label_str}]"
 
-# ══════════════════════════════════════════════════════════════════
-#  节点特征（79维，无零填充）
-# ══════════════════════════════════════════════════════════════════
+    token_ids = tokenizer.encode_with_special(label_str, add_bos=True, add_eos=True)
+    token_ids = token_ids[:max_len]
 
-def atom_features(atom) -> list:
+    result = torch.full((max_len,), tokenizer.pad_token_id, dtype=torch.long)
+    result[:len(token_ids)] = torch.tensor(token_ids, dtype=torch.long)
+    return result
+
+
+def _build_history(
+    history_records : list,
+    tokenizer,
+    max_hist_len    : int,
+    max_label_len   : int,
+) -> dict:
     """
-    提取单个原子的 79 维特征，每一维都有实际含义。
+    将 history 列表转为四个 padding 后的张量
 
-    维度分布:
-      [0 :45]  原子类型      One-Hot 45维
-      [45:52]  度数          One-Hot  7维
-      [52:60]  形式电荷      One-Hot  8维
-      [60:66]  隐式氢数      One-Hot  6维
-      [66:72]  杂化方式      One-Hot  6维
-      [72:77]  手性          One-Hot  5维
-      [77]     是否芳香      连续     1维
-      [78]     是否在环      连续     1维
+    Args:
+      history_records : JSON 中的 history 列表
+                        每项: {action_type, src_idx, tgt_idx, label}
+      tokenizer       : LabelTokenizer
+      max_hist_len    : 历史最大步数 T
+      max_label_len   : label 序列最大长度 L
+
+    Returns（形状均已 padding 到固定长度）:
+      history_actions    : [T]    long，padding = PAD_ACTION_ID
+      history_src_idxs   : [T]    long，无效步 = pad_atom_id
+      history_tgt_idxs   : [T]    long，无效步 = pad_atom_id
+      history_label_seqs : [T, L] long，padding = pad_token_id
     """
-    feat = (
-        one_hot_encoding(atom.GetSymbol(),        PERMITTED_SYMBOLS)      # 45
-      + one_hot_encoding(atom.GetDegree(),         PERMITTED_DEGREES)      #  7
-      + one_hot_encoding(atom.GetFormalCharge(),   PERMITTED_FORMAL_CHRGS) #  8
-      + one_hot_encoding(atom.GetTotalNumHs(),     PERMITTED_NUM_HS)       #  6
-      + one_hot_encoding(atom.GetHybridization(),  PERMITTED_HYBRIDIZATION)#  6
-      + one_hot_encoding(atom.GetChiralTag(),      PERMITTED_CHIRAL)       #  5
-      + [int(atom.GetIsAromatic())]                                        #  1
-      + [int(atom.IsInRing())]                                             #  1
-    )
-    # 45+7+8+6+6+5+1+1 = 79
-    # assert len(feat) == NODE_FEATURE_DIM, \
-    #     f"节点特征维度错误: 期望 {NODE_FEATURE_DIM}, 实际 {len(feat)}"
-    return feat
+    pad_atom = MODEL_CFG.pad_atom_id
 
-# ══════════════════════════════════════════════════════════════════
-#  边特征（12维）—— 新增！
-# ══════════════════════════════════════════════════════════════════
+    T = min(len(history_records), max_hist_len)
 
-def bond_features(bond) -> list:
+    actions    = torch.full((max_hist_len,),               PAD_ACTION_ID,          dtype=torch.long)
+    src_idxs   = torch.full((max_hist_len,),               pad_atom,               dtype=torch.long)
+    tgt_idxs   = torch.full((max_hist_len,),               pad_atom,               dtype=torch.long)
+    label_seqs = torch.full((max_hist_len, max_label_len), tokenizer.pad_token_id, dtype=torch.long)
+
+    for i, rec in enumerate(history_records[:T]):
+        # action_type（int）
+        actions[i] = int(rec.get("action_type", PAD_ACTION_ID))
+
+        # src_idx：None 或 -1 → pad_atom
+        src = rec.get("src_idx", None)
+        src_idxs[i] = src if (src is not None and src >= 0) else pad_atom
+
+        # tgt_idx：None 或 -1 → pad_atom
+        tgt = rec.get("tgt_idx", None)
+        tgt_idxs[i] = tgt if (tgt is not None and tgt >= 0) else pad_atom
+
+        # label 编码
+        label_str = rec.get("label", None) or "NONE"
+        label_seqs[i] = _encode_label(label_str, tokenizer, max_label_len)
+
+    return {
+        "history_actions"   : actions,      # [T]
+        "history_src_idxs"  : src_idxs,     # [T]
+        "history_tgt_idxs"  : tgt_idxs,     # [T]
+        "history_label_seqs": label_seqs,   # [T, L]
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  目标值构建
+# ══════════════════════════════════════════════════════════════════════
+
+def _build_target(record: dict, tokenizer, max_label_len: int) -> dict:
     """
-    提取单条键的 12 维特征。
+    构建单步预测目标
 
-    维度分布:
-      [0 :5]   键类型        One-Hot  5维  (单/双/三/芳香/UNK)
-      [5]      是否共轭      连续     1维
-      [6]      是否在环      连续     1维
-      [7:12]   立体化学      One-Hot  5维
+    Returns:
+      target_action : [1]  long
+      target_src    : [1]  long（无效 = -1，CrossEntropyLoss ignore_index=-1）
+      target_tgt    : [1]  long（无效 = -1）
+      target_label  : [L]  long（含 BOS/EOS，padding 到 max_label_len）
     """
-    feat = (
-        one_hot_encoding(bond.GetBondType(),   PERMITTED_BOND_TYPES)   # 5
-      + [int(bond.GetIsConjugated())]                                   # 1
-      + [int(bond.IsInRing())]                                          # 1
-      + one_hot_encoding(bond.GetStereo(),     PERMITTED_BOND_STEREO)  # 5
-    )
-    # 5+1+1+5 = 12
-    assert len(feat) == EDGE_FEATURE_DIM, \
-        f"边特征维度错误: 期望 {EDGE_FEATURE_DIM}, 实际 {len(feat)}"
-    return feat
+    # action_type
+    act = record.get("target_action_type", 0)
+    target_action = torch.tensor([int(act) if act is not None else 0], dtype=torch.long)
+
+    # src / tgt（None 或 -1 → -1）
+    src = record.get("target_src_idx", None)
+    tgt = record.get("target_tgt_idx", None)
+    target_src = torch.tensor([src if (src is not None and src >= 0) else -1], dtype=torch.long)
+    target_tgt = torch.tensor([tgt if (tgt is not None and tgt >= 0) else -1], dtype=torch.long)
+
+    # label
+    label_str    = record.get("target_label", None) or "NONE"
+    target_label = _encode_label(label_str, tokenizer, max_label_len)  # [L]
+
+    return {
+        "target_action": target_action,
+        "target_src"   : target_src,
+        "target_tgt"   : target_tgt,
+        "target_label" : target_label,
+    }
 
 
+# ══════════════════════════════════════════════════════════════════════
+#  StepData：覆写 __inc__ / __cat_dim__ 防止 PyG 错误 offset
+# ══════════════════════════════════════════════════════════════════════
+
+class StepData(Data):
+    """
+    单步 MDP 样本的 PyG Data 子类
+
+    覆写原因：
+      PyG DataLoader 默认对名称含 "index" 的属性自动 += num_nodes。
+      history_src_idxs / history_tgt_idxs / target_src / target_tgt
+      是原子索引，不应被 offset，必须覆写 __inc__ 返回 0。
+
+      history_label_seqs 是 [T, L] 的 2D 张量，
+      需覆写 __cat_dim__ 确保在 dim=0（batch 维度）正确堆叠。
+    """
+
+    # 不做 offset 的属性集合
+    _NO_OFFSET_KEYS = frozenset({
+        "history_src_idxs",
+        "history_tgt_idxs",
+        "target_src",
+        "target_tgt",
+    })
+
+    # 在 dim=0 拼接的自定义属性
+    _CAT_DIM0_KEYS = frozenset({
+        "history_actions",
+        "history_src_idxs",
+        "history_tgt_idxs",
+        "history_label_seqs",
+        "target_action",
+        "target_src",
+        "target_tgt",
+        "target_label",
+    })
+
+    def __inc__(self, key: str, value, *args, **kwargs) -> int:
+        if key in self._NO_OFFSET_KEYS:
+            return 0   # 原子索引：不 offset
+        return super().__inc__(key, value, *args, **kwargs)
+
+    def __cat_dim__(self, key: str, value, *args, **kwargs) -> int:
+        if key in self._CAT_DIM0_KEYS:
+            return 0   # 所有自定义属性在 batch 维度（dim=0）拼接
+        return super().__cat_dim__(key, value, *args, **kwargs)
 
 
-def smiles_to_graph(smiles: str) -> tuple:
-    """将 SMILES 转换为 PyG 的 x 和 edge_index"""
-    mol = Chem.MolFromSmiles(smiles)
-    if mol is None:
-        return None, None
-        
-    # ── 1. 节点特征 ──────────────────────────────────────────────────
-    x = []
-    for atom in mol.GetAtoms():
-        feature = atom_features(atom) # [N, 79]
-        # 补齐到 128 维 (对应 GraphEncoder 的 node_in_dim=128)
-        # 当前 feature 长度大约在 78 维左右
-        pad_length = 128 - len(feature)
-        if pad_length > 0:
-            feature += [0] * pad_length
-        else:
-            feature = feature[:128] # 防御性截断
-            
-        x.append(feature)
-    x_tensor = torch.tensor(x, dtype=torch.float)
-
-    # ── 2. 边索引 ───────────────────────────────────────────
-    edge_index = []
-    for bond in mol.GetBonds():
-        i = bond.GetBeginAtomIdx()
-        j = bond.GetEndAtomIdx()
-        # 无向图，双向添加
-        edge_index.append([i, j])
-        edge_index.append([j, i])
-        
-
-    if len(edge_index) > 0:
-        edge_index_tensor = torch.tensor(edge_index, dtype=torch.long).t().contiguous()
-    else:
-        edge_index_tensor = torch.empty((2, 0), dtype=torch.long)
-        
-    return x_tensor, edge_index_tensor
-
+# ══════════════════════════════════════════════════════════════════════
+#  SSRGraphDataset
+# ══════════════════════════════════════════════════════════════════════
 
 class SSRGraphDataset(torch.utils.data.Dataset):
-    def __init__(self, json_path: str, tokenizer, max_seq_len: int = 20, max_hist_len: int = 10):
-        """
-        Args:
-            json_path: 展开后的单步训练数据 (steps.json)
-            tokenizer: 实例化的 LabelTokenizer 对象
-            max_seq_len: Label 序列最大长度
-            max_hist_len: 历史动作序列最大长度
-        """
-        with open(json_path, 'r', encoding='utf-8') as f:
-            self.data = json.load(f)
-            
-        self.tokenizer = tokenizer
-        self.max_seq_len = max_seq_len
-        self.max_hist_len = max_hist_len
+    """
+    单步 MDP 预训练数据集
 
-    def __len__(self):
+    每条样本对应一个展开后的单步决策：
+      输入：product graph + history（已执行的编辑序列，完整 4 字段）
+      输出：下一步的 (action_type, src_idx, tgt_idx, label)
+
+    Args:
+      json_path    : 数据文件路径（JSON 列表 或 JSONL）
+      tokenizer    : LabelTokenizer 实例
+      max_seq_len  : label 序列最大长度（默认从 MODEL_CFG 读取）
+      max_hist_len : 历史最大步数（默认从 MODEL_CFG 读取）
+    """
+
+    def __init__(
+        self,
+        json_path    : str,
+        tokenizer,
+        max_seq_len  : int = None,
+        max_hist_len : int = None,
+    ):
+        self.tokenizer    = tokenizer
+        self.max_seq_len  = max_seq_len  or MODEL_CFG.max_seq_len
+        self.max_hist_len = max_hist_len or MODEL_CFG.max_hist_len
+
+        # 支持 JSON 列表 和 JSONL 两种格式
+        path = Path(json_path)
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+        if content.startswith("["):
+            self.data = json.loads(content)
+        else:
+            self.data = [json.loads(l) for l in content.splitlines() if l.strip()]
+
+        print(f"[SSRGraphDataset] loaded {len(self.data)} records ← {json_path}")
+
+    def __len__(self) -> int:
         return len(self.data)
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int) -> StepData:
+        """
+        返回第 idx 条样本的 StepData
+
+        StepData 字段一览：
+          x                  : [N, 79]        float  节点特征
+          edge_index         : [2, 2E]         long   边索引（无向双向）
+          edge_attr          : [2E, 12]        float  边特征
+          history_actions    : [T]             long   历史动作类型
+          history_src_idxs   : [T]             long   历史 src 原子索引
+          history_tgt_idxs   : [T]             long   历史 tgt 原子索引
+          history_label_seqs : [T, L]          long   历史 label token 序列
+          target_action      : [1]             long   目标动作类型
+          target_src         : [1]             long   目标 src（-1=无效）
+          target_tgt         : [1]             long   目标 tgt（-1=无效）
+          target_label       : [L]             long   目标 label token 序列
+        """
         item = self.data[idx]
-        
-        # ==========================================
-        # 1. 图结构特征 (复用之前的 smiles_to_graph 函数)
-        # ==========================================
-        x, edge_index = smiles_to_graph(item['product_smi'])
-        
-        # ==========================================
-        # 2. 历史编辑状态 (History)
-        # ==========================================
-        history_actions = [h['action_type'] for h in item['history']]
-        history_actions = history_actions[-self.max_hist_len:] 
-        
-        # 假设动作类型 7 为 PAD (对应没有历史动作的位置)
-        history_actions += [7] * (self.max_hist_len - len(history_actions))
-        
-        # ==========================================
-        # 3. Label 序列处理 (使用你的 LabelTokenizer)
-        # ==========================================
-        raw_label = item['target_label']
-        
-        # 【兼容性补丁】如果你没有修改 tokenizer.py 中的中括号，取消下面两行的注释：
-        if raw_label in ["NONE", "SINGLE", "DOUBLE", "TRIPLE", "AROMATIC", "CW", "CCW"]:
-            raw_label = f"[{raw_label}]"
-            
-        # 调用 tokenizer 编码，自动添加 [BOS] 和 [EOS]
-        token_ids = self.tokenizer.encode_with_special(
-            raw_label, 
-            add_bos=True, 
-            add_eos=True
+
+        # ── 1. 分子图 ─────────────────────────────────────────────────
+        x, edge_index, edge_attr = smiles_to_graph(item["product_smi"])
+        if x is None:
+            # SMILES 解析失败：单节点空图，不中断训练
+            x          = torch.zeros(1, get_atom_feat_dim())
+            edge_index = torch.zeros((2, 0), dtype=torch.long)
+            edge_attr  = torch.zeros((0, get_edge_feat_dim()))
+
+        # ── 2. 历史动作序列（完整 4 字段）────────────────────────────
+        hist = _build_history(
+            history_records = item.get("history", []),
+            tokenizer       = self.tokenizer,
+            max_hist_len    = self.max_hist_len,
+            max_label_len   = self.max_seq_len,
         )
-        
-        # 截断到 max_seq_len
-        token_ids = token_ids[:self.max_seq_len]
-        
-        # 使用 tokenizer 的 pad_token_id 进行 Padding
-        pad_id = self.tokenizer.pad_token_id
-        token_ids += [pad_id] * (self.max_seq_len - len(token_ids))
-        
-        # ==========================================
-        # 4. 打包为 PyG Data 对象
-        # ==========================================
-        data = Data(x=x, edge_index=edge_index)
-        
-        # 统一转为 Tensor 并增加一维，方便 PyG DataLoader 自动拼接 Batch
 
-        # 处理可能为 None 的 target_src_idx 和 target_tgt_idx
-        # 如果为 None，则赋值为 -1 (配合 CrossEntropyLoss 的 ignore_index=-1)
-        src_idx = item['target_src_idx']
-        tgt_idx = item['target_tgt_idx']
-        
-        src_idx = -1 if src_idx is None else src_idx
-        tgt_idx = -1 if tgt_idx is None else tgt_idx
-        
-        # 统一转为 Tensor 并增加一维，方便 PyG DataLoader 自动拼接 Batch
-        data.target_action = torch.tensor([item['target_action_type']], dtype=torch.long)
-        data.target_src = torch.tensor([src_idx], dtype=torch.long)
-        data.target_tgt = torch.tensor([tgt_idx], dtype=torch.long)
-        data.target_label = torch.tensor([token_ids], dtype=torch.long)
-        data.history_actions = torch.tensor([history_actions], dtype=torch.long)
+        # ── 3. 训练目标 ───────────────────────────────────────────────
+        tgt = _build_target(
+            record        = item,
+            tokenizer     = self.tokenizer,
+            max_label_len = self.max_seq_len,
+        )
 
-        # data.target_action = torch.tensor([item['target_action_type']], dtype=torch.long)
-        # data.target_src = torch.tensor([item['target_src_idx']], dtype=torch.long)
-        # data.target_tgt = torch.tensor([item['target_tgt_idx']], dtype=torch.long)
-        # data.target_label = torch.tensor([token_ids], dtype=torch.long)
-        # data.history_actions = torch.tensor([history_actions], dtype=torch.long)
-        
-        return data
-
-
-
-
+        # ── 4. 组装 StepData ──────────────────────────────────────────
+        return StepData(
+            # 图结构
+            x          = x,
+            edge_index = edge_index,
+            edge_attr  = edge_attr,
+            # 历史（完整 4 字段）
+            history_actions    = hist["history_actions"],     # [T]
+            history_src_idxs   = hist["history_src_idxs"],   # [T]
+            history_tgt_idxs   = hist["history_tgt_idxs"],   # [T]
+            history_label_seqs = hist["history_label_seqs"], # [T, L]
+            # 目标
+            target_action = tgt["target_action"],   # [1]
+            target_src    = tgt["target_src"],       # [1]
+            target_tgt    = tgt["target_tgt"],       # [1]
+            target_label  = tgt["target_label"],     # [L]
+        )

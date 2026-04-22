@@ -40,73 +40,186 @@ BOND_TYPES = [
 ]
 
 
-def one_hot(val, choices: list) -> list:
-    return [1 if val == c else 0 for c in choices] + [0 if val in choices else 1]
+
+# ══════════════════════════════════════════════════════════════════════
+#  原子 / 键特征定义
+# ══════════════════════════════════════════════════════════════════════
+
+PERMITTED_SYMBOLS = [
+    'C','N','O','S','F','Si','P','Cl','Br','Mg','Na','Ca','Fe',
+    'As','Al','I','B','V','K','Tl','Yb','Sb','Sn','Ag','Pd','Co',
+    'Se','Ti','Zn','H','Li','Ge','Cu','Au','Ni','Cd','In','Mn',
+    'Zr','Cr','Pt','Hg','Pb',
+]  # 43种 + UNK = 44 → one_hot = 45
+
+PERMITTED_DEGREES       = [0, 1, 2, 3, 4, 5]
+PERMITTED_FORMAL_CHRGS  = [-3, -2, -1, 0, 1, 2, 3]
+PERMITTED_NUM_HS        = [0, 1, 2, 3, 4]
+PERMITTED_HYBRIDIZATION = [
+    rdchem.HybridizationType.SP,
+    rdchem.HybridizationType.SP2,
+    rdchem.HybridizationType.SP3,
+    rdchem.HybridizationType.SP3D,
+    rdchem.HybridizationType.SP3D2,
+]
+PERMITTED_CHIRAL = [
+    rdchem.ChiralType.CHI_UNSPECIFIED,
+    rdchem.ChiralType.CHI_TETRAHEDRAL_CW,
+    rdchem.ChiralType.CHI_TETRAHEDRAL_CCW,
+    rdchem.ChiralType.CHI_OTHER,
+]
+PERMITTED_BOND_TYPES  = [
+    rdchem.BondType.SINGLE, rdchem.BondType.DOUBLE,
+    rdchem.BondType.TRIPLE, rdchem.BondType.AROMATIC,
+]
+PERMITTED_BOND_STEREO = [
+    rdchem.BondStereo.STEREONONE, rdchem.BondStereo.STEREOANY,
+    rdchem.BondStereo.STEREOZ,    rdchem.BondStereo.STEREOE,
+]
 
 
-def atom_features(atom) -> list:
-    """提取单个原子特征 (39维)"""
-    return (
-        one_hot(atom.GetSymbol(), ATOM_TYPES[:-1])          # 44维 → 截断到43+1
-        + one_hot(atom.GetDegree(), [0,1,2,3,4,5])          # 7维
-        + one_hot(atom.GetTotalNumHs(), [0,1,2,3,4])        # 6维
-        + one_hot(atom.GetImplicitValence(), [0,1,2,3,4,5]) # 7维
-        + one_hot(atom.GetHybridization(), HYBRIDIZATION)   # 6维
-        + [atom.GetIsAromatic()]                             # 1维
-        + [atom.GetFormalCharge()]                           # 1维
-        + [atom.IsInRing()]                                  # 1维
-    )
-    # 注意: 实际维度由上面累加决定，需与 node_in_dim 对齐
-    # 建议在 config 中设置 node_in_dim = get_atom_feat_dim()
-
-
+# ══════════════════════════════════════════════════════════════════════
+#  特征提取工具
+# ══════════════════════════════════════════════════════════════════════
 def get_atom_feat_dim() -> int:
     """动态计算原子特征维度"""
-    from rdkit import Chem
     mol = Chem.MolFromSmiles("C")
     return len(atom_features(mol.GetAtomWithIdx(0)))
 
+def get_edge_feat_dim() -> int:
+    """动态计算键特征维度"""
+    mol = Chem.MolFromSmiles("C-C")
+    return len(bond_features(mol.GetBondWithIdx(0)))
+
+
+def _one_hot(value, choices: list) -> list:
+    """One-Hot 编码，不在 choices 中时最后一位(UNK)置 1，长度 = len(choices)+1"""
+    enc = [0] * (len(choices) + 1)
+    enc[choices.index(value) if value in choices else -1] = 1
+    return enc
+
+
+def atom_features(atom) -> list:
+    """
+    79 维原子特征（无零填充，每维均有化学含义）
+      [0 :45] 原子类型  One-Hot 45
+      [45:52] 度数      One-Hot  7
+      [52:60] 形式电荷  One-Hot  8
+      [60:66] 隐式氢数  One-Hot  6
+      [66:72] 杂化方式  One-Hot  6
+      [72:77] 手性      One-Hot  5
+      [77]    是否芳香  1
+      [78]    是否在环  1
+    """
+    feat = (
+        _one_hot(atom.GetSymbol(),       PERMITTED_SYMBOLS)
+      + _one_hot(atom.GetDegree(),        PERMITTED_DEGREES)
+      + _one_hot(atom.GetFormalCharge(),  PERMITTED_FORMAL_CHRGS)
+      + _one_hot(atom.GetTotalNumHs(),    PERMITTED_NUM_HS)
+      + _one_hot(atom.GetHybridization(), PERMITTED_HYBRIDIZATION)
+      + _one_hot(atom.GetChiralTag(),     PERMITTED_CHIRAL)
+      + [int(atom.GetIsAromatic())]
+      + [int(atom.IsInRing())]
+    )
+    # assert len(feat) == NODE_FEATURE_DIM, \
+    #     f"节点特征维度错误: 期望 {NODE_FEATURE_DIM}, 实际 {len(feat)}"
+    return feat
+
 
 def bond_features(bond) -> list:
-    """提取键特征 (6维)"""
-    bt = bond.GetBondType()
-    return (
-        one_hot(bt, BOND_TYPES[:-1])   # 4维
-        + [bond.GetIsConjugated()]      # 1维
-        + [bond.IsInRing()]             # 1维
+    """
+    12 维键特征
+      [0:5]  键类型    One-Hot 5
+      [5]    是否共轭  1
+      [6]    是否在环  1
+      [7:12] 立体化学  One-Hot 5
+    """
+    feat = (
+        _one_hot(bond.GetBondType(), PERMITTED_BOND_TYPES)
+      + [int(bond.GetIsConjugated())]
+      + [int(bond.IsInRing())]
+      + _one_hot(bond.GetStereo(), PERMITTED_BOND_STEREO)
     )
+    # assert len(feat) == EDGE_FEATURE_DIM, \
+    #     f"边特征维度错误: 期望 {EDGE_FEATURE_DIM}, 实际 {len(feat)}"
+    return feat
 
-def smiles_to_pyg(smiles: str, with_hydrogen: bool = False) -> Optional[Data]:
-    """SMILES → PyG Data
 
-    Returns None if SMILES is invalid.
+# ══════════════════════════════════════════════════════════════════════
+#  SMILES → PyG 图（x, edge_index, edge_attr）
+# ══════════════════════════════════════════════════════════════════════
+
+def smiles_to_graph(smiles: str):
+    """
+    将 SMILES 转为 (x, edge_index, edge_attr)
+      x          : [N, NODE_FEATURE_DIM=79]  float
+      edge_index : [2, 2*E]                  long（无向图，双向）
+      edge_attr  : [2*E, EDGE_FEATURE_DIM=12] float
+    解析失败返回 (None, None, None)
     """
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
-        return None
-    if with_hydrogen:
-        mol = Chem.AddHs(mol)
+        return None, None, None
 
-    # 原子特征
-    atom_feats = [atom_features(a) for a in mol.GetAtoms()]
-    x = torch.tensor(atom_feats, dtype=torch.float)  # [N, node_in_dim]
+    # 节点特征 [N, 79]
+    x = torch.tensor(
+        [atom_features(a) for a in mol.GetAtoms()], dtype=torch.float
+    )
 
-    # 键 (双向)
-    if mol.GetNumBonds() == 0:
-        edge_index = torch.zeros((2, 0), dtype=torch.long)
-        edge_attr  = torch.zeros((0, 6), dtype=torch.float)
+    # 边索引 + 边特征（无向图双向）
+    src_list, tgt_list, edge_feats = [], [], []
+    for bond in mol.GetBonds():
+        i, j = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+        bf    = bond_features(bond)
+        src_list += [i, j]
+        tgt_list += [j, i]
+        edge_feats += [bf, bf]   # 双向共享同一特征
+
+    if src_list:
+        edge_index = torch.tensor([src_list, tgt_list], dtype=torch.long)
+        edge_attr  = torch.tensor(edge_feats, dtype=torch.float)
     else:
-        src, dst, eattr = [], [], []
-        for bond in mol.GetBonds():
-            i, j = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
-            bf = bond_features(bond)
-            src += [i, j]; dst += [j, i]
-            eattr += [bf, bf]
-        edge_index = torch.tensor([src, dst], dtype=torch.long)
-        edge_attr  = torch.tensor(eattr, dtype=torch.float)
+        edge_index = torch.zeros((2, 0), dtype=torch.long)
+        edge_attr  = torch.zeros((0, EDGE_FEATURE_DIM), dtype=torch.float)
 
-    return Data(x=x, edge_index=edge_index, edge_attr=edge_attr,
-                num_nodes=mol.GetNumAtoms())
+    return x, edge_index, edge_attr
+
+
+
+
+# def atom_features(atom) -> list:
+#     """提取单个原子特征 (39维)"""
+#     return (
+#         one_hot(atom.GetSymbol(), ATOM_TYPES[:-1])          # 44维 → 截断到43+1
+#         + one_hot(atom.GetDegree(), [0,1,2,3,4,5])          # 7维
+#         + one_hot(atom.GetTotalNumHs(), [0,1,2,3,4])        # 6维
+#         + one_hot(atom.GetImplicitValence(), [0,1,2,3,4,5]) # 7维
+#         + one_hot(atom.GetHybridization(), HYBRIDIZATION)   # 6维
+#         + [atom.GetIsAromatic()]                             # 1维
+#         + [atom.GetFormalCharge()]                           # 1维
+#         + [atom.IsInRing()]                                  # 1维
+#     )
+#     # 注意: 实际维度由上面累加决定，需与 node_in_dim 对齐
+#     # 建议在 config 中设置 node_in_dim = get_atom_feat_dim()
+
+
+# def get_atom_feat_dim() -> int:
+#     """动态计算原子特征维度"""
+#     from rdkit import Chem
+#     mol = Chem.MolFromSmiles("C")
+#     return len(atom_features(mol.GetAtomWithIdx(0)))
+
+
+# def bond_features(bond) -> list:
+#     """提取键特征 (6维)"""
+#     bt = bond.GetBondType()
+#     return (
+#         one_hot(bt, BOND_TYPES[:-1])   # 4维
+#         + [bond.GetIsConjugated()]      # 1维
+#         + [bond.IsInRing()]             # 1维
+#     )
+
+
 
 def make_sentence_to_string(rules):
     rules_data = list(map(lambda rule: ", ".join([" ".join(r) for r in eval(rule)]), rules))

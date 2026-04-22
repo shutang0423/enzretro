@@ -68,7 +68,7 @@ class UncertaintyWeighting(nn.Module):
 STAGES = [
     {
         "name": "Stage-Joint-All", 
-        "epochs": TC.get("stage4_epochs", 200),  # 建议适当增加 Epoch 数量
+        "epochs": TC.get("stage4_epochs", 500),  # 建议适当增加 Epoch 数量
         "tasks": ["action", "src", "tgt", "label"], 
         "freeze": []  # 不冻结任何模块，全参数更新
     }
