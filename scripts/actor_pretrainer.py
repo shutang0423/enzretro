@@ -208,13 +208,16 @@ def unpack_batch(
         label_seqs = h_label_seqs,
     )
 
-    # ── encoder kwargs ────────────────────────────────────────────────
-    if MODEL_CFG.encoder_type == "gat":
-        graph_kw = dict(x=batch.x, edge_index=batch.edge_index, batch=batch.batch)
-    else:
-        graph_kw = dict(fingerprint=batch.fingerprint)
+
+    # ── encoder kwargs ────────────────────────────────────────────────────
+    graph_kw = dict(
+        x          = batch.x,
+        edge_index = batch.edge_index,
+        batch      = batch.batch,
+    )
 
     return history, tf, graph_kw, target_tgt
+
 
 # ══════════════════════════════════════════════════════════════════════
 #  原始 Loss 计算（只做 CE，不做加权）

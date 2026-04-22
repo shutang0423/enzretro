@@ -99,7 +99,13 @@ class PointerNetwork(nn.Module):
         """
         B = decoder_state.size(0)
 
-        if not has_nodes:
+        # ── 修复：兼容 has_nodes 是 Tensor 还是 bool 的情况 ──────────────
+        if isinstance(has_nodes, torch.Tensor):
+            _has_nodes = has_nodes.any().item()  # 只要 batch 中有任何一个图有节点就算 True
+        else:
+            _has_nodes = bool(has_nodes)
+
+        if not _has_nodes:
             inf_logits = torch.full(
                 (B, self.max_atoms), float("-inf"),
                 device=decoder_state.device,

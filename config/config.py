@@ -59,7 +59,7 @@ class PathConfig:
     只需传入 project_name，其余路径全部自动推导。
     __post_init__ 会自动创建所有 *_DIR 目录。
     """
-    project_name: str = "pretrain_20260420_fp"
+    project_name: str = "pretrain_20260420_gcn"
 
     # ── 根目录 ────────────────────────────────────────────────────────
     ROOT_DIR: Path = field(default_factory=lambda: Path("."))
@@ -134,24 +134,25 @@ class PathConfig:
 
 @dataclass
 class ModelConfig:
-    """
-    网络结构超参
-    所有维度、层数、编码器类型集中在此，防止各模块硬编码。
-    """
-    # ── 编码器类型（消融实验切换点）──────────────────────────────────
-    encoder_type : str = "fingerprint"    # "gat" | "fingerprint"
+    # ── 编码器选择 ──────────────────────────────
+    encoder_type : str   = "gcn"   # gat | gcn | gin | sage | transformer
 
-    # ── 节点 / 图特征维度 ─────────────────────────────────────────────
-    node_in_dim  : int = field(default_factory=get_atom_feat_dim)
-    node_dim     : int = 256             # GraphEncoder 内部 & 输出维度
-    hidden_dim   : int = 256             # StateTracker / 预测头统一维度
+    # ── 节点特征 ────────────────────────────────
+    node_in_dim  : int   = get_atom_feat_dim()
+    node_dim     : int   = 512
 
-    # ── GAT 超参 ──────────────────────────────────────────────────────
-    gat_layers   : int = 4
-    gat_heads    : int = 4
+    # ── GNN 超参 ────────────────────────────────
+    num_layers   : int   = 4
+    gnn_heads    : int   = 4       # gat / transformer 专用
+    gnn_dropout  : float = 0.1
+    gnn_residual : bool  = True
+    gnn_pooling  : str   = "mean"  # "mean" | "add"
 
-    # ── 指纹编码器超参（encoder_type="fingerprint" 时生效）──────────
-    fp_dim       : int = 2048            # Morgan 指纹维度
+    # ── Decoder ─────────────────────────────────
+    vocab_size        : int  = 500
+    hidden_dim        : int  = 512
+    num_heads         : int  = 8
+    num_decoder_layers: int  = 3
 
     # ── 动作 / 原子 / 序列 ────────────────────────────────────────────
     num_actions  : int = NUM_ACTIONS     # 与模块级常量保持同步
@@ -167,7 +168,6 @@ class ModelConfig:
     pad_token_id : int = 0
     bos_token_id : int = 1
     eos_token_id : int = 2
-
 
 # ══════════════════════════════════════════════════════════════════════
 #  StageConfig & TrainConfig

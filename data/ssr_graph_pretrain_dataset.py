@@ -36,7 +36,7 @@ from rdkit import Chem
 from rdkit.Chem import rdchem
 
 from config.config import MODEL_CFG, PAD_ACTION_ID
-from utils.chem import atom_features, bond_features, get_atom_feat_dim, get_edge_feat_dim, smiles_to_graph
+from utils.chem import get_atom_feat_dim, get_edge_feat_dim, smiles_to_graph, smiles_to_fingerprint
 
 # ══════════════════════════════════════════════════════════════════════
 #  历史序列构建（完整 4 字段）
@@ -271,6 +271,10 @@ class SSRGraphDataset(torch.utils.data.Dataset):
             edge_index = torch.zeros((2, 0), dtype=torch.long)
             edge_attr  = torch.zeros((0, get_edge_feat_dim()))
 
+        # # ── Morgan 指纹（始终计算，两种 encoder 模式均可用）──────────
+        # fingerprint = smiles_to_fingerprint(item["product_smi"], fp_dim=MODEL_CFG.fp_dim)
+        # fingerprint = fingerprint.unsqueeze(0)   # [1, fp_dim]
+
         # ── 2. 历史动作序列（完整 4 字段）────────────────────────────
         hist = _build_history(
             history_records = item.get("history", []),
@@ -292,6 +296,7 @@ class SSRGraphDataset(torch.utils.data.Dataset):
             x          = x,
             edge_index = edge_index,
             edge_attr  = edge_attr,
+            # fingerprint = fingerprint,
             # 历史（完整 4 字段）
             history_actions    = hist["history_actions"],     # [T]
             history_src_idxs   = hist["history_src_idxs"],   # [T]

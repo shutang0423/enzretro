@@ -4,6 +4,7 @@ import argparse
 import pandas as pd
 from PIL import Image
 from io import BytesIO
+import numpy as np
 from multiprocessing import Process, Queue
 from typing import Dict, Tuple, List, Union, Optional
 from rdkit import Chem
@@ -185,39 +186,25 @@ def smiles_to_graph(smiles: str):
     return x, edge_index, edge_attr
 
 
+# ══════════════════════════════════════════════════════════════════════
+#  指纹计算工具
+# ══════════════════════════════════════════════════════════════════════
 
-
-# def atom_features(atom) -> list:
-#     """提取单个原子特征 (39维)"""
-#     return (
-#         one_hot(atom.GetSymbol(), ATOM_TYPES[:-1])          # 44维 → 截断到43+1
-#         + one_hot(atom.GetDegree(), [0,1,2,3,4,5])          # 7维
-#         + one_hot(atom.GetTotalNumHs(), [0,1,2,3,4])        # 6维
-#         + one_hot(atom.GetImplicitValence(), [0,1,2,3,4,5]) # 7维
-#         + one_hot(atom.GetHybridization(), HYBRIDIZATION)   # 6维
-#         + [atom.GetIsAromatic()]                             # 1维
-#         + [atom.GetFormalCharge()]                           # 1维
-#         + [atom.IsInRing()]                                  # 1维
-#     )
-#     # 注意: 实际维度由上面累加决定，需与 node_in_dim 对齐
-#     # 建议在 config 中设置 node_in_dim = get_atom_feat_dim()
-
-
-# def get_atom_feat_dim() -> int:
-#     """动态计算原子特征维度"""
-#     from rdkit import Chem
-#     mol = Chem.MolFromSmiles("C")
-#     return len(atom_features(mol.GetAtomWithIdx(0)))
-
-
-# def bond_features(bond) -> list:
-#     """提取键特征 (6维)"""
-#     bt = bond.GetBondType()
-#     return (
-#         one_hot(bt, BOND_TYPES[:-1])   # 4维
-#         + [bond.GetIsConjugated()]      # 1维
-#         + [bond.IsInRing()]             # 1维
-#     )
+def smiles_to_fingerprint(
+    smiles  : str,
+    fp_dim  : int = 2048,
+    radius  : int = 2,
+) -> torch.Tensor:
+    """
+    计算 Morgan 指纹，返回 FloatTensor [fp_dim]
+    若 SMILES 无效，返回全零向量（不抛异常，保证数据集健壮性）
+    """
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return torch.zeros(fp_dim, dtype=torch.float)
+    fp  = AllChem.GetMorganFingerprintAsBitVect(mol, radius=radius, nBits=fp_dim)
+    arr = np.frombuffer(fp.ToBitString().encode(), dtype=np.uint8) - ord('0')
+    return torch.from_numpy(arr.copy()).float()   # [fp_dim]
 
 
 

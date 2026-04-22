@@ -32,8 +32,8 @@ from typing import List, Optional, Tuple
 import torch
 import torch.nn as nn
 
-from config.config import MODEL_CFG, ModelConfig
-from model.encoders         import build_encoder, EncoderOutput
+from config.config import MODEL_CFG
+from model.encoders         import build_encoder
 from model.state_tracker    import StateTracker, HistoryBatch
 from model.prediction_heads import ActionTypePredictor, PointerNetwork, LabelDecoder
 
@@ -140,7 +140,7 @@ class ActorNetwork(nn.Module):
     #  内部工具
     # ══════════════════════════════════════════════════════════════════
 
-    def _encode(self, **encoder_kwargs) -> Tuple[EncoderOutput, torch.Tensor]:
+    def _encode(self, **encoder_kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         统一编码入口：调用可插拔 Encoder，并将 graph_emb 投影到 hidden_dim
         返回:

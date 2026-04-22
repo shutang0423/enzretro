@@ -1,196 +1,214 @@
-"""
-encoders.py —— 可插拔分子编码器
-
-消融实验 1
-  GATEncoder         : 图注意力网络，输出节点嵌入 + 图嵌入
-  FingerprintEncoder : Morgan 指纹 + MLP，仅输出图嵌入（无节点概念）
-
-统一输出接口 EncoderOutput，下游模块无感知切换。
-"""
-
 from __future__ import annotations
-from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from typing import Optional
+from typing import NamedTuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch_geometric.nn import GATConv, global_mean_pool
-from torch_geometric.utils import to_dense_batch
-from config.config import ModelConfig
+from torch_geometric.nn import (
+    GATConv, GCNConv, GINConv, SAGEConv, TransformerConv,
+    global_mean_pool, global_add_pool,
+)
+from torch_geometric.utils import to_dense_batch   # ← 关键工具函数
+from config.config import MODEL_CFG
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  统一输出容器
+#  返回值类型（完整版，供 pointer_network 使用）
 # ══════════════════════════════════════════════════════════════════════
 
-@dataclass
-class EncoderOutput:
+class EncoderOutput(NamedTuple):
+    node_emb     : torch.Tensor   # [N, node_dim]       稀疏节点表示
+    graph_emb    : torch.Tensor   # [B, node_dim]       图级表示
+    dense_nodes  : torch.Tensor   # [B, max_atoms, d]   稠密节点矩阵（含 padding）
+    node_pad_mask: torch.Tensor   # [B, max_atoms]      True = padding 位（无效）
+    has_nodes    : torch.Tensor   # [B]  bool           该图是否有节点
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  GNN 基类
+# ══════════════════════════════════════════════════════════════════════
+
+class BaseGNNEncoder(nn.Module):
     """
-    所有 Encoder 的统一输出格式
-
-    graph_emb     : [B, node_dim]            图级别嵌入（必有）
-    dense_nodes   : [B, max_nodes, node_dim] 节点嵌入 Dense Batch（GAT有，指纹为零）
-    node_pad_mask : [B, max_nodes]           True=padding（GAT有，指纹全False）
-    has_nodes     : bool                     是否有有效节点嵌入（消融时判断）
+    所有 GNN 编码器的公共基类。
+    forward 返回完整 EncoderOutput，包含：
+      - 稀疏节点表示 node_emb      [N, d]
+      - 图级表示     graph_emb     [B, d]
+      - 稠密节点矩阵 dense_nodes   [B, max_atoms, d]
+      - padding 掩码 node_pad_mask [B, max_atoms]  True=padding
+      - 有效标志     has_nodes     [B] bool
     """
-    graph_emb     : torch.Tensor
-    dense_nodes   : torch.Tensor
-    node_pad_mask : torch.Tensor
-    has_nodes     : bool = True
 
-
-# ══════════════════════════════════════════════════════════════════════
-#  抽象基类
-# ══════════════════════════════════════════════════════════════════════
-
-class MoleculeEncoderBase(ABC, nn.Module):
-    """所有分子编码器的基类，强制统一输出接口"""
-
-    @abstractmethod
-    def forward(self, **kwargs) -> EncoderOutput:
-        """子类实现各自的编码逻辑，统一返回 EncoderOutput"""
-        ...
-
-    @property
-    @abstractmethod
-    def node_dim(self) -> int:
-        """输出的节点/图嵌入维度"""
-        ...
-
-
-# ══════════════════════════════════════════════════════════════════════
-#  实现 1：GAT 图编码器（主方案）
-# ══════════════════════════════════════════════════════════════════════
-
-class GATEncoder(MoleculeEncoderBase):
-    """
-    图注意力网络编码器
-
-    输入: x [N, node_in_dim], edge_index [2, E], batch [N]
-    输出: EncoderOutput
-      - graph_emb     [B, node_dim]
-      - dense_nodes   [B, max_nodes, node_dim]
-      - node_pad_mask [B, max_nodes]  True=padding
-      - has_nodes     = True
-    """
     def __init__(
         self,
         node_in_dim : int,
         node_dim    : int,
-        num_layers  : int = 4,
-        gat_heads   : int = 4,
+        num_layers  : int,
+        dropout     : float = 0.1,
+        residual    : bool  = True,
+        pooling     : str   = "mean",
     ):
         super().__init__()
-        self._node_dim  = node_dim
-        self.node_proj  = nn.Linear(node_in_dim, node_dim)
-        self.convs       = nn.ModuleList([
-            GATConv(node_dim, node_dim, heads=gat_heads, concat=False)
-            for _ in range(num_layers)
-        ])
-        self.graph_pool = nn.Sequential(
-            nn.Linear(node_dim, node_dim),
-            nn.ReLU(),
-        )
+        self.residual = residual
+        self.dropout  = nn.Dropout(dropout)
+        self.pool_fn  = global_mean_pool if pooling == "mean" else global_add_pool
 
-    @property
-    def node_dim(self) -> int:
-        return self._node_dim
+        self.input_proj = (
+            nn.Linear(node_in_dim, node_dim)
+            if node_in_dim != node_dim else nn.Identity()
+        )
+        self.convs = self._build_conv_layers(node_dim, num_layers)
+        self.norms = nn.ModuleList([nn.LayerNorm(node_dim) for _ in range(num_layers)])
+        self.acts  = nn.ModuleList([nn.GELU()              for _ in range(num_layers)])
+
+    def _build_conv_layers(self, node_dim: int, num_layers: int) -> nn.ModuleList:
+        raise NotImplementedError
+
+    def _conv_forward(self, conv: nn.Module, x: torch.Tensor,
+                      edge_index: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError
 
     def forward(
         self,
         x          : torch.Tensor,   # [N, node_in_dim]
         edge_index : torch.Tensor,   # [2, E]
-        batch      : torch.Tensor,   # [N]
-        **kwargs,
+        batch      : torch.Tensor,   # [N]  节点→图映射
     ) -> EncoderOutput:
-        h = self.node_proj(x)
-        for conv in self.convs:
-            h = F.relu(conv(h, edge_index)) + h          # 残差
+        # ── 1. GNN 消息传递 ──────────────────────────────────────────
+        x = self.input_proj(x)
+        for conv, norm, act in zip(self.convs, self.norms, self.acts):
+            h = self._conv_forward(conv, x, edge_index)
+            h = norm(h)
+            h = act(h)
+            h = self.dropout(h)
+            x = (x + h) if self.residual else h
 
-        graph_emb   = self.graph_pool(global_mean_pool(h, batch))  # [B, node_dim]
-        dense_nodes, node_mask = to_dense_batch(h, batch)          # [B, max_N, D], [B, max_N]
-        node_pad_mask = ~node_mask                                  # True = padding
+        node_emb  = x                           # [N, node_dim]
+        graph_emb = self.pool_fn(x, batch)      # [B, node_dim]
+
+        # ── 2. 稀疏 → 稠密，供指针网络使用 ──────────────────────────
+        # to_dense_batch: [N,d] + batch → [B, max_nodes, d], mask [B, max_nodes]
+        # mask: True = 有效节点，False = padding
+        dense_nodes, valid_mask = to_dense_batch(node_emb, batch)  # valid=True 有效
+
+        # pointer_network 习惯用 True=padding，取反
+        node_pad_mask = ~valid_mask              # [B, max_atoms]  True=padding
+
+        # ── 3. has_nodes：每个图至少有 1 个有效节点 ──────────────────
+        has_nodes = valid_mask.any(dim=-1)       # [B]  bool
 
         return EncoderOutput(
-            graph_emb=graph_emb,
-            dense_nodes=dense_nodes,
-            node_pad_mask=node_pad_mask,
-            has_nodes=True,
+            node_emb      = node_emb,
+            graph_emb     = graph_emb,
+            dense_nodes   = dense_nodes,
+            node_pad_mask = node_pad_mask,
+            has_nodes     = has_nodes,
         )
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  实现 2：分子指纹编码器（消融对照组）
+#  具体 GNN 编码器（子类只需实现两个方法，forward 完全继承）
 # ══════════════════════════════════════════════════════════════════════
 
-class FingerprintEncoder(MoleculeEncoderBase):
-    """
-    分子指纹编码器（消融实验对照组）
+class GATEncoder(BaseGNNEncoder):
+    def __init__(self, node_in_dim, node_dim, num_layers, heads=4, **kwargs):
+        assert node_dim % heads == 0, f"node_dim({node_dim}) 须整除 heads({heads})"
+        self._heads = heads
+        super().__init__(node_in_dim, node_dim, num_layers, **kwargs)
 
-    使用预计算的 Morgan/ECFP 指纹（由 Dataset 提供），
-    通过 MLP 映射到与 GATEncoder 相同的 node_dim 空间。
+    def _build_conv_layers(self, node_dim, num_layers):
+        head_dim = node_dim // self._heads
+        return nn.ModuleList([
+            GATConv(node_dim, head_dim, heads=self._heads, concat=True)
+            for _ in range(num_layers)
+        ])
 
-    输入: fingerprint [B, fp_dim]  (float, 0/1 二值或连续)
-    输出: EncoderOutput
-      - graph_emb     [B, node_dim]
-      - dense_nodes   [B, 1, node_dim]  零占位（Pointer 退化）
-      - node_pad_mask [B, 1]            全 True（Pointer 全部 mask）
-      - has_nodes     = False           下游可据此跳过 Pointer 任务
-    """
-    def __init__(
-        self,
-        fp_dim   : int,
-        node_dim : int,
-    ):
-        super().__init__()
-        self._node_dim = node_dim
-        self.mlp = nn.Sequential(
-            nn.Linear(fp_dim, node_dim * 2),
-            nn.ReLU(),
-            nn.LayerNorm(node_dim * 2),
-            nn.Linear(node_dim * 2, node_dim),
-            nn.ReLU(),
-            nn.LayerNorm(node_dim),
-        )
+    def _conv_forward(self, conv, x, edge_index):
+        return conv(x, edge_index)
 
-    @property
-    def node_dim(self) -> int:
-        return self._node_dim
 
-    def forward(
-        self,
-        fingerprint : torch.Tensor,   # [B, fp_dim]
-        **kwargs,
-    ) -> EncoderOutput:
-        B          = fingerprint.size(0)
-        graph_emb  = self.mlp(fingerprint)                          # [B, node_dim]
+class GCNEncoder(BaseGNNEncoder):
+    def _build_conv_layers(self, node_dim, num_layers):
+        return nn.ModuleList([
+            GCNConv(node_dim, node_dim) for _ in range(num_layers)
+        ])
 
-        # 占位节点：Pointer Network 在 has_nodes=False 时应跳过
-        dense_nodes   = torch.zeros(B, 1, self._node_dim, device=fingerprint.device)
-        node_pad_mask = torch.ones(B, 1, dtype=torch.bool, device=fingerprint.device)
+    def _conv_forward(self, conv, x, edge_index):
+        return conv(x, edge_index)
 
-        return EncoderOutput(
-            graph_emb=graph_emb,
-            dense_nodes=dense_nodes,
-            node_pad_mask=node_pad_mask,
-            has_nodes=False,
-        )
+
+class GINEncoder(BaseGNNEncoder):
+    def _build_conv_layers(self, node_dim, num_layers):
+        def _mlp():
+            return nn.Sequential(
+                nn.Linear(node_dim, node_dim * 2),
+                nn.BatchNorm1d(node_dim * 2),
+                nn.GELU(),
+                nn.Linear(node_dim * 2, node_dim),
+            )
+        return nn.ModuleList([
+            GINConv(_mlp(), train_eps=True) for _ in range(num_layers)
+        ])
+
+    def _conv_forward(self, conv, x, edge_index):
+        return conv(x, edge_index)
+
+
+class GraphSAGEEncoder(BaseGNNEncoder):
+    def _build_conv_layers(self, node_dim, num_layers):
+        return nn.ModuleList([
+            SAGEConv(node_dim, node_dim, normalize=True)
+            for _ in range(num_layers)
+        ])
+
+    def _conv_forward(self, conv, x, edge_index):
+        return conv(x, edge_index)
+
+
+class GraphTransformerEncoder(BaseGNNEncoder):
+    def __init__(self, node_in_dim, node_dim, num_layers, heads=4, **kwargs):
+        assert node_dim % heads == 0
+        self._heads = heads
+        super().__init__(node_in_dim, node_dim, num_layers, **kwargs)
+
+    def _build_conv_layers(self, node_dim, num_layers):
+        head_dim = node_dim // self._heads
+        return nn.ModuleList([
+            TransformerConv(node_dim, head_dim, heads=self._heads, concat=True)
+            for _ in range(num_layers)
+        ])
+
+    def _conv_forward(self, conv, x, edge_index):
+        return conv(x, edge_index)
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  工厂函数：根据 config 自动选择 Encoder
+#  工厂函数
 # ══════════════════════════════════════════════════════════════════════
 
-# encoders.py 的工厂函数同步修改
-def build_encoder(cfg: ModelConfig):
-    if cfg.encoder_type == "gat":
-        return GATEncoder(
-            node_in_dim = cfg.node_in_dim,
-            node_dim    = cfg.node_dim,
-            num_layers  = cfg.gat_layers,
-            gat_heads   = cfg.gat_heads,
+_ENCODER_REGISTRY: dict[str, type] = {
+    "gat"        : GATEncoder,
+    "gcn"        : GCNEncoder,
+    "gin"        : GINEncoder,
+    "sage"       : GraphSAGEEncoder,
+    "transformer": GraphTransformerEncoder,
+}
+
+
+def build_encoder(cfg=MODEL_CFG) -> BaseGNNEncoder:
+    t = cfg.encoder_type.lower()
+    if t not in _ENCODER_REGISTRY:
+        raise ValueError(
+            f"未知 encoder_type='{t}'，可选: {list(_ENCODER_REGISTRY.keys())}"
         )
-    elif cfg.encoder_type == "fingerprint":
-        return FingerprintEncoder(fp_dim=cfg.fp_dim, node_dim=cfg.node_dim)
+    common = dict(
+        node_in_dim = cfg.node_in_dim,
+        node_dim    = cfg.node_dim,
+        num_layers  = cfg.num_layers,
+        dropout     = cfg.gnn_dropout,
+        residual    = cfg.gnn_residual,
+        pooling     = cfg.gnn_pooling,
+    )
+    if t in ("gat", "transformer"):
+        common["heads"] = cfg.gnn_heads
+
+    return _ENCODER_REGISTRY[t](**common)
