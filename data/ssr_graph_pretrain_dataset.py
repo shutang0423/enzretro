@@ -86,26 +86,27 @@ def _build_history(
 
     T = min(len(history_records), max_hist_len)
 
-    actions    = torch.full((max_hist_len,),               PAD_ACTION_ID,          dtype=torch.long)
-    src_idxs   = torch.full((max_hist_len,),               pad_atom,               dtype=torch.long)
-    tgt_idxs   = torch.full((max_hist_len,),               pad_atom,               dtype=torch.long)
-    label_seqs = torch.full((max_hist_len, max_label_len), tokenizer.pad_token_id, dtype=torch.long)
+    # Add batch dimension to ensure proper batching
+    actions    = torch.full((1, max_hist_len),               PAD_ACTION_ID,          dtype=torch.long)  # [1, T]
+    src_idxs   = torch.full((1, max_hist_len),               pad_atom,               dtype=torch.long)  # [1, T]
+    tgt_idxs   = torch.full((1, max_hist_len),               pad_atom,               dtype=torch.long)  # [1, T]
+    label_seqs = torch.full((1, max_hist_len, max_label_len), tokenizer.pad_token_id, dtype=torch.long)  # [1, T, L]
 
     for i, rec in enumerate(history_records[:T]):
         # action_type（int）
-        actions[i] = int(rec.get("action_type", PAD_ACTION_ID))
+        actions[0, i] = int(rec.get("action_type", PAD_ACTION_ID))
 
         # src_idx：None 或 -1 → pad_atom
         src = rec.get("src_idx", None)
-        src_idxs[i] = src if (src is not None and src >= 0) else pad_atom
+        src_idxs[0, i] = src if (src is not None and src >= 0) else pad_atom
 
         # tgt_idx：None 或 -1 → pad_atom
         tgt = rec.get("tgt_idx", None)
-        tgt_idxs[i] = tgt if (tgt is not None and tgt >= 0) else pad_atom
+        tgt_idxs[0, i] = tgt if (tgt is not None and tgt >= 0) else pad_atom
 
         # label 编码
         label_str = rec.get("label", None) or "NONE"
-        label_seqs[i] = _encode_label(label_str, tokenizer, max_label_len)
+        label_seqs[0, i] = _encode_label(label_str, tokenizer, max_label_len)
 
     return {
         "history_actions"   : actions,      # [T]

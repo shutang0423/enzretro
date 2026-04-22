@@ -42,6 +42,9 @@ class ActionTypePredictor(nn.Module):
 # ══════════════════════════════════════════════════════════════════════
 #  Pointer Network
 # ══════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════
+#  Pointer Network
+# ══════════════════════════════════════════════════════════════════════
 
 class PointerNetwork(nn.Module):
     """
@@ -53,7 +56,12 @@ class PointerNetwork(nn.Module):
 
     Teacher Forcing：训练时传 target_src_idx，推理时用 argmax
     消融兼容：has_nodes=False 时直接返回全 -inf（不参与梯度）
+
+    越界防御：
+      所有 Embedding 查表前 clamp 到合法范围，
+      避免数据噪声触发 CUDA indexSelectLargeIndex assert
     """
+
     def __init__(
         self,
         hidden_dim  : int,
@@ -62,60 +70,160 @@ class PointerNetwork(nn.Module):
         max_atoms   : int,
     ):
         super().__init__()
+        self.num_actions = num_actions
+        self.max_atoms   = max_atoms
+
         self.action_emb = nn.Embedding(num_actions, hidden_dim)
         self.src_emb    = nn.Embedding(max_atoms,   hidden_dim)
         self.node_proj  = nn.Linear(node_dim, hidden_dim)
 
-        self.q_src = nn.Linear(hidden_dim, hidden_dim)
-        self.k_src = nn.Linear(hidden_dim, hidden_dim)
-        self.q_tgt = nn.Linear(hidden_dim, hidden_dim)
-        self.k_tgt = nn.Linear(hidden_dim, hidden_dim)
+        self.q_src = nn.Linear(hidden_dim * 2, hidden_dim)
+        self.k_src = nn.Linear(hidden_dim,     hidden_dim)
+        self.q_tgt = nn.Linear(hidden_dim * 3, hidden_dim)
+        self.k_tgt = nn.Linear(hidden_dim,     hidden_dim)
+
+        self._scale = hidden_dim ** -0.5
 
     def forward(
         self,
-        decoder_state   : torch.Tensor,             # [B, H]
-        dense_nodes     : torch.Tensor,             # [B, max_nodes, node_dim]
-        action_type     : torch.Tensor,             # [B]
-        target_src_idx  : Optional[torch.Tensor] = None,  # [B] Teacher Forcing
-        node_mask       : Optional[torch.Tensor] = None,  # [B, max_nodes] True=padding
+        decoder_state   : torch.Tensor,                       # [B, H]
+        dense_nodes     : torch.Tensor,                       # [B, max_nodes, node_dim]
+        action_type     : torch.Tensor,                       # [B]
+        target_src_idx  : Optional[torch.Tensor] = None,     # [B] Teacher Forcing
+        node_mask       : Optional[torch.Tensor] = None,     # [B, max_nodes] True=padding
         has_nodes       : bool = True,
     ):
         """
         返回: src_logits [B, max_nodes], tgt_logits [B, max_nodes]
         has_nodes=False 时返回全 -inf（FingerprintEncoder 消融用）
         """
+        B = decoder_state.size(0)
+
         if not has_nodes:
-            # 指纹模式：无节点概念，返回占位 logits（不参与有效 loss 计算）
-            dummy = torch.full(
-                (decoder_state.size(0), 1), -1e9,
-                device=decoder_state.device
+            inf_logits = torch.full(
+                (B, self.max_atoms), float("-inf"),
+                device=decoder_state.device,
             )
-            return dummy, dummy
+            return inf_logits, inf_logits
 
-        act_e      = self.action_emb(action_type)            # [B, H]
-        nodes_proj = self.node_proj(dense_nodes)             # [B, max_nodes, H]
+        # ── 越界防御：clamp 所有 Embedding 索引 ──────────────────────
+        action_type_safe = action_type.clamp(0, self.num_actions - 1)  # [B]
 
-        # ── src ──────────────────────────────────────────────────────
-        q_src      = self.q_src(decoder_state + act_e).unsqueeze(1)  # [B, 1, H]
-        k_src      = self.k_src(nodes_proj)                          # [B, max_nodes, H]
+        # ── action 嵌入 ───────────────────────────────────────────────
+        a_emb = self.action_emb(action_type_safe)    # [B, H]
+
+        # ── 节点投影 ──────────────────────────────────────────────────
+        k_src = self.k_src(self.node_proj(dense_nodes))  # [B, max_nodes, H]
+        k_tgt = self.k_tgt(self.node_proj(dense_nodes))  # [B, max_nodes, H]
+
+        # ── src 预测 ──────────────────────────────────────────────────
+        q_src = self.q_src(
+            torch.cat([decoder_state, a_emb], dim=-1)
+        ).unsqueeze(1)                                    # [B, 1, H]
+
         src_logits = torch.bmm(q_src, k_src.transpose(1, 2)).squeeze(1)  # [B, max_nodes]
+        src_logits = src_logits * self._scale
+
+        # padding 位置置 -inf
         if node_mask is not None:
-            src_logits = src_logits.masked_fill(node_mask, -1e9)
+            src_logits = src_logits.masked_fill(node_mask, float("-inf"))
 
-        # Teacher Forcing / 推理 argmax
-        src_idx = (target_src_idx if target_src_idx is not None
-                   else src_logits.argmax(dim=-1))
-        src_idx = src_idx.clamp(0, self.src_emb.num_embeddings - 1)
-        src_e   = self.src_emb(src_idx)                              # [B, H]
+        # ── tgt 预测（Teacher Forcing / Greedy）──────────────────────
+        if target_src_idx is not None:
+            # 训练：使用真实 src
+            src_idx_safe = target_src_idx.clamp(0, self.max_atoms - 1)  # [B]
+        else:
+            # 推理：使用预测 src（先屏蔽 padding 再 argmax）
+            src_idx_safe = src_logits.argmax(dim=-1).clamp(0, self.max_atoms - 1)
 
-        # ── tgt ──────────────────────────────────────────────────────
-        q_tgt      = self.q_tgt(decoder_state + act_e + src_e).unsqueeze(1)
-        k_tgt      = self.k_tgt(nodes_proj)
-        tgt_logits = torch.bmm(q_tgt, k_tgt.transpose(1, 2)).squeeze(1)
+        s_emb = self.src_emb(src_idx_safe)               # [B, H]
+
+        q_tgt = self.q_tgt(
+            torch.cat([decoder_state, a_emb, s_emb], dim=-1)
+        ).unsqueeze(1)                                    # [B, 1, H]
+
+        tgt_logits = torch.bmm(q_tgt, k_tgt.transpose(1, 2)).squeeze(1)  # [B, max_nodes]
+        tgt_logits = tgt_logits * self._scale
+
         if node_mask is not None:
-            tgt_logits = tgt_logits.masked_fill(node_mask, -1e9)
+            tgt_logits = tgt_logits.masked_fill(node_mask, float("-inf"))
 
-        return src_logits, tgt_logits
+        return src_logits, tgt_logits   # [B, max_nodes], [B, max_nodes]
+
+
+# class PointerNetwork(nn.Module):
+#     """
+#     注意力指针网络：预测操作的 src / tgt 原子索引
+
+#     数据流：
+#       state + action_emb → Q_src → 与 K_src 点积 → src_logits [B, max_nodes]
+#       state + action_emb + src_emb → Q_tgt → 与 K_tgt 点积 → tgt_logits [B, max_nodes]
+
+#     Teacher Forcing：训练时传 target_src_idx，推理时用 argmax
+#     消融兼容：has_nodes=False 时直接返回全 -inf（不参与梯度）
+#     """
+#     def __init__(
+#         self,
+#         hidden_dim  : int,
+#         node_dim    : int,
+#         num_actions : int,
+#         max_atoms   : int,
+#     ):
+#         super().__init__()
+#         self.action_emb = nn.Embedding(num_actions, hidden_dim)
+#         self.src_emb    = nn.Embedding(max_atoms,   hidden_dim)
+#         self.node_proj  = nn.Linear(node_dim, hidden_dim)
+
+#         self.q_src = nn.Linear(hidden_dim, hidden_dim)
+#         self.k_src = nn.Linear(hidden_dim, hidden_dim)
+#         self.q_tgt = nn.Linear(hidden_dim, hidden_dim)
+#         self.k_tgt = nn.Linear(hidden_dim, hidden_dim)
+
+#     def forward(
+#         self,
+#         decoder_state   : torch.Tensor,             # [B, H]
+#         dense_nodes     : torch.Tensor,             # [B, max_nodes, node_dim]
+#         action_type     : torch.Tensor,             # [B]
+#         target_src_idx  : Optional[torch.Tensor] = None,  # [B] Teacher Forcing
+#         node_mask       : Optional[torch.Tensor] = None,  # [B, max_nodes] True=padding
+#         has_nodes       : bool = True,
+#     ):
+#         """
+#         返回: src_logits [B, max_nodes], tgt_logits [B, max_nodes]
+#         has_nodes=False 时返回全 -inf（FingerprintEncoder 消融用）
+#         """
+#         if not has_nodes:
+#             # 指纹模式：无节点概念，返回占位 logits（不参与有效 loss 计算）
+#             dummy = torch.full(
+#                 (decoder_state.size(0), 1), -1e9,
+#                 device=decoder_state.device
+#             )
+#             return dummy, dummy
+
+#         act_e      = self.action_emb(action_type)            # [B, H]
+#         nodes_proj = self.node_proj(dense_nodes)             # [B, max_nodes, H]
+
+#         # ── src ──────────────────────────────────────────────────────
+#         q_src      = self.q_src(decoder_state + act_e).unsqueeze(1)  # [B, 1, H]
+#         k_src      = self.k_src(nodes_proj)                          # [B, max_nodes, H]
+#         src_logits = torch.bmm(q_src, k_src.transpose(1, 2)).squeeze(1)  # [B, max_nodes]
+#         if node_mask is not None:
+#             src_logits = src_logits.masked_fill(node_mask, -1e9)
+
+#         # Teacher Forcing / 推理 argmax
+#         src_idx = (target_src_idx if target_src_idx is not None
+#                    else src_logits.argmax(dim=-1))
+#         src_idx = src_idx.clamp(0, self.src_emb.num_embeddings - 1)
+#         src_e   = self.src_emb(src_idx)                              # [B, H]
+
+#         # ── tgt ──────────────────────────────────────────────────────
+#         q_tgt      = self.q_tgt(decoder_state + act_e + src_e).unsqueeze(1)
+#         k_tgt      = self.k_tgt(nodes_proj)
+#         tgt_logits = torch.bmm(q_tgt, k_tgt.transpose(1, 2)).squeeze(1)
+#         if node_mask is not None:
+#             tgt_logits = tgt_logits.masked_fill(node_mask, -1e9)
+
+#         return src_logits, tgt_logits
 
 
 # ══════════════════════════════════════════════════════════════════════
