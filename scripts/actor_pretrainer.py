@@ -37,6 +37,15 @@ from data.ssr_graph_pretrain_dataset import SSRGraphDataset
 from model.actor_network import ActorNetwork, TeacherForcingTargets
 from model.state_tracker import HistoryBatch
 from model.loss_strategy import build_loss_strategy, LossStrategyBase
+from utils.early_stopping import EarlyStopping
+
+# ── main() 内，stage 循环之前，初始化早停 ─────────────────────────────
+early_stopping = EarlyStopping(
+    patience = TRAIN_CFG.early_stop_patience,   # 默认 10，见 config.py
+    mode     = "min",                           # 监控 val_loss，越小越好
+    delta    = 1e-4,                            # 最小改善幅度
+    verbose  = True,
+)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -547,6 +556,15 @@ def main():
                         PATH_CFG.CKPT_BEST_MODEL_FILE,
                     )
                     print(f"  ✓ best model saved  val_loss={val_loss:.4f}")
+                
+                # ── 早停判断 ──────────────────────────────────────────────
+                if early_stopping.step(val_loss, epoch):
+                    print(
+                        f"[Stage {stage.name}] 早停触发，"
+                        f"最优 epoch={early_stopping.best_epoch}，"
+                        f"最优 val_loss={early_stopping.best_value:.6f}"
+                    )
+                    break   # 跳出 epoch 循环，进入下一 stage 或结束训练
             else:
                 print(
                     f"  [{stage.name}] epoch {epoch:>3}/{stage.epochs}"

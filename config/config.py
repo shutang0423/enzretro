@@ -31,11 +31,12 @@ from utils.chem import get_atom_feat_dim
 ACTION_TYPES: List[str] = [
     "DeleteBond",    # 0
     "ChangeBond",    # 1
-    "AttachGroup",   # 2
-    "ChangeAtom",    # 3
+    "AddBond",       # 2
+    "AttachGroup",   # 3
+    "ChangeAtom",    # 4
     # "AddAtom",     # 暂不启用
     # "AddRing",     # 暂不启用
-    "Terminate",     # 4
+    "Terminate",     # 5
 ]
 
 ACTION_TO_ID   : Dict[str, int] = {a: i for i, a in enumerate(ACTION_TYPES)}
@@ -59,7 +60,7 @@ class PathConfig:
     只需传入 project_name，其余路径全部自动推导。
     __post_init__ 会自动创建所有 *_DIR 目录。
     """
-    project_name: str = "pretrain_20260420_gcn"
+    project_name: str = "pretrain_20260426_gcn_uncertainty"
 
     # ── 根目录 ────────────────────────────────────────────────────────
     ROOT_DIR: Path = field(default_factory=lambda: Path("."))
@@ -135,7 +136,7 @@ class PathConfig:
 @dataclass
 class ModelConfig:
     # ── 编码器选择 ──────────────────────────────
-    encoder_type : str   = "gcn"   # gat | gcn | gin | sage | transformer
+    encoder_type : str   = "gat"   # gat | gcn | gin | sage | transformer
 
     # ── 节点特征 ────────────────────────────────
     node_in_dim  : int   = get_atom_feat_dim()
@@ -149,7 +150,7 @@ class ModelConfig:
     gnn_pooling  : str   = "mean"  # "mean" | "add"
 
     # ── Decoder ─────────────────────────────────
-    vocab_size        : int  = 500
+    vocab_size        : int  = 137
     hidden_dim        : int  = 512
     num_heads         : int  = 8
     num_decoder_layers: int  = 3
@@ -168,6 +169,7 @@ class ModelConfig:
     pad_token_id : int = 0
     bos_token_id : int = 1
     eos_token_id : int = 2
+
 
 # ══════════════════════════════════════════════════════════════════════
 #  StageConfig & TrainConfig
@@ -203,6 +205,7 @@ class TrainConfig:
     weight_decay : float = 1e-2
     grad_clip    : float = 1.0           # 梯度裁剪阈值（clip_grad_norm_）
     warmup_ratio : float = 0.1           # warmup 占总步数比例
+    early_stop_patience : int = 10  # 早停耐心轮数
 
     # ── Loss 策略（消融实验切换点）───────────────────────────────────
     # "uncertainty" | "equal" | "manual" | "single_task"
@@ -225,7 +228,7 @@ class TrainConfig:
     stages: List[StageConfig] = field(default_factory=lambda: [
         StageConfig(
             name         = "Joint-All",
-            epochs       = 500,
+            epochs       = 300,
             active_tasks = [],            # 空 = 全部激活
             freeze       = [],
             lr_scale     = 1.0,
@@ -258,24 +261,27 @@ class LoRAConfig:
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  RLConfig（Phase 2 预留）
+#  RL
 # ══════════════════════════════════════════════════════════════════════
+@dataclass
+class RLInferenceConfig:
+    """强化学习推理配置"""
+    inference_method: str = "monte_carlo"  # "monte_carlo", "policy_gradient"
+    max_steps: int = 10
+    num_rollouts: int = 5
+    temperature: float = 1.0
+    discount_factor: float = 0.9
 
 @dataclass
-class RLConfig:
-    """强化学习超参（Phase 2 PPO 训练时使用）"""
-    lr            : float = 1e-4
-    weight_decay  : float = 1e-2
-    clip_eps      : float = 0.2
-    ppo_epochs    : int   = 4
-    batch_size    : int   = 64
-    kl_beta       : float = 0.1          # KL 惩罚系数
-    vf_coef       : float = 0.5
-    entropy_coef  : float = 0.01
-    gamma         : float = 0.99
-    gae_lambda    : float = 0.95
-    rollout_steps : int   = 2048
-    max_epochs    : int   = 100
+class RewardConfig:
+    """奖励计算配置"""
+    reward_method: str = "step_comparison"  # "step_comparison", "action_only", "comprehensive"
+    action_weight: float = 1.0
+    src_weight: float = 0.5
+    tgt_weight: float = 0.5
+    label_weight: float = 0.8
+    step_weight: float = 0.3
+    discount_factor: float = 0.9
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -286,4 +292,4 @@ PATH_CFG  = PathConfig()
 MODEL_CFG = ModelConfig()
 TRAIN_CFG = TrainConfig()
 LORA_CFG  = LoRAConfig()
-RL_CFG    = RLConfig()
+RL_CFG    = RLInferenceConfig()

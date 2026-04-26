@@ -21,19 +21,20 @@ dataset_builder.py
 
 import json
 from pathlib import Path
+from config.config import ACTION_TYPES, STOP_ACTION_ID, ID_TO_ACTION, ACTION_TO_ID
 
 # action_type 字符串 → 整数映射
-ACTION_TYPE_MAP = {
-    "DeleteBond":  0,
-    "ChangeBond":  1,
-    "AddBond":     2,
-    "AttachGroup": 3,
-    "LeaveGroup":  4,
-    "ChangeAtom":  5,
-    "Terminate":   6,
-}
+# ACTION_TYPES = {
+#     "DeleteBond":  0,
+#     "ChangeBond":  1,
+#     "AddBond":     2,
+#     "AttachGroup": 3,
+#     "LeaveGroup":  4,
+#     "ChangeAtom":  5,
+#     "Terminate":   6,
+# }
 
-TERMINATE_INT = ACTION_TYPE_MAP["Terminate"]
+TERMINATE_INT = STOP_ACTION_ID
 
 # def expand_reaction(reaction: dict) -> list[dict]:
 def expand_reaction(reaction):
@@ -56,7 +57,7 @@ def expand_reaction(reaction):
     history = []
 
     for step, edit in enumerate(edits):
-        action_type_int = ACTION_TYPE_MAP[edit["action_type"]]
+        action_type_int = ACTION_TO_ID[edit["action_type"]]
         is_terminate    = (action_type_int == TERMINATE_INT)
 
         sample = {
@@ -131,4 +132,4 @@ if __name__ == "__main__":
         process_edits_to_steps(input_json,output_json)
 
     
-    all_output_json = 'dataset/uspto50k/pretrained/uspto50k_train_valid_test_output.json'
+    # all_output_json = 'dataset/uspto50k/pretrained/uspto50k_train_valid_test_output.json'
