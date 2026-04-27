@@ -60,7 +60,7 @@ class PathConfig:
     只需传入 project_name，其余路径全部自动推导。
     __post_init__ 会自动创建所有 *_DIR 目录。
     """
-    project_name: str = "pretrain_20260426_gcn_uncertainty"
+    project_name: str = "pretrain_20260426_gat_manual"
 
     # ── 根目录 ────────────────────────────────────────────────────────
     ROOT_DIR: Path = field(default_factory=lambda: Path("."))
@@ -209,11 +209,11 @@ class TrainConfig:
 
     # ── Loss 策略（消融实验切换点）───────────────────────────────────
     # "uncertainty" | "equal" | "manual" | "single_task"
-    loss_strategy: str        = "uncertainty"
+    loss_strategy: str        = "manual"
 
     # manual 策略：各任务权重（顺序与 TASK_NAMES 对齐）
     loss_weights : List[float] = field(
-        default_factory=lambda: [1.0, 1.0, 1.0, 1.0]
+        default_factory=lambda: [0.1, 0.4, 0.3, 0.2]
     )
 
     # single_task 策略：指定唯一激活的任务名
@@ -261,8 +261,9 @@ class LoRAConfig:
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  RL
+#  RLConfig（Phase 2 预留）
 # ══════════════════════════════════════════════════════════════════════
+
 @dataclass
 class RLInferenceConfig:
     """强化学习推理配置"""
@@ -270,17 +271,6 @@ class RLInferenceConfig:
     max_steps: int = 10
     num_rollouts: int = 5
     temperature: float = 1.0
-    discount_factor: float = 0.9
-
-@dataclass
-class RewardConfig:
-    """奖励计算配置"""
-    reward_method: str = "step_comparison"  # "step_comparison", "action_only", "comprehensive"
-    action_weight: float = 1.0
-    src_weight: float = 0.5
-    tgt_weight: float = 0.5
-    label_weight: float = 0.8
-    step_weight: float = 0.3
     discount_factor: float = 0.9
 
 

@@ -353,7 +353,7 @@ class ActorNetwork(nn.Module):
 
         # ── 推断 batch_size & device ─────────────────────────────────
         first_val  = next(iter(encoder_kwargs.values()))
-        batch_size = first_val.size(0)
+        batch_size = 1 # first_val.size(0)
         device     = first_val.device
 
         # ── 初始化空历史（第 0 步）───────────────────────────────────

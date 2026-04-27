@@ -10,7 +10,7 @@ import torch
 import json
 from pathlib import Path
 
-from config.config import PATH_CFG, MODEL_CFG, ACTION_TYPES, ID_TO_ACTION, ACTION_TO_ID, RLInferenceConfig, STOP_ACTION_ID
+from config.config import PATH_CFG, ID_TO_ACTION, RLInferenceConfig, STOP_ACTION_ID
 from model.actor_network import ActorNetwork
 from utils.chem import smiles_to_graph
 from tokenizer.tokenizer import LabelTokenizer
@@ -44,7 +44,7 @@ def test_single_example(test_smiles: str = 'CCOC(=O)C1CCC2(CC1)OCCO2',
         return
     
     print(f"Loading checkpoint from {checkpoint_path}")
-    ckpt = torch.load(checkpoint_path, map_location=device)
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
     model.load_state_dict(ckpt['model'])
     model.eval()
     
