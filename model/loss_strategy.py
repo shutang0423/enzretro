@@ -185,7 +185,7 @@ def build_loss_strategy(cfg) -> LossStrategyBase:
     elif strategy == "equal":
         return EqualWeighting()
     elif strategy == "manual":
-        return ManualWeighting(task_weights=cfg.task_weights)
+        return ManualWeighting(task_weights=dict(zip(TASK_NAMES, cfg.loss_weights)))
     elif strategy == "single_task":
         return SingleTaskWeighting(task_name=cfg.single_task)
     else:

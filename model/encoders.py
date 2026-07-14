@@ -21,6 +21,7 @@ class EncoderOutput(NamedTuple):
     dense_nodes  : torch.Tensor   # [B, max_atoms, d]   稠密节点矩阵（含 padding）
     node_pad_mask: torch.Tensor   # [B, max_atoms]      True = padding 位（无效）
     has_nodes    : torch.Tensor   # [B]  bool           该图是否有节点
+    adj_matrix   : torch.Tensor   # [B, max_atoms, max_atoms]  稠密邻接矩阵（1=有键连接）
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -96,12 +97,42 @@ class BaseGNNEncoder(nn.Module):
         # ── 3. has_nodes：每个图至少有 1 个有效节点 ──────────────────
         has_nodes = valid_mask.any(dim=-1)       # [B]  bool
 
+        # ── 4. 构建稠密邻接矩阵 ──────────────────────────────────────
+        B = graph_emb.size(0)
+        max_n = dense_nodes.size(1)
+        adj = torch.zeros(B, max_n, max_n, device=x.device)
+
+        if edge_index.size(1) > 0:
+            # 计算每个节点在其所属图中的局部位置
+            graph_sizes = torch.bincount(batch, minlength=B)  # [B] 每图节点数
+            offsets = torch.cat([
+                torch.zeros(1, device=x.device, dtype=torch.long),
+                torch.cumsum(graph_sizes, dim=0)[:-1]
+            ])  # [B]
+
+            local_idx = torch.arange(node_emb.size(0), device=x.device)  # [N]
+            local_idx = local_idx - offsets[batch]  # [N] 各节点在图内的局部索引
+
+            src_local = local_idx[edge_index[0]]  # [E]
+            tgt_local = local_idx[edge_index[1]]  # [E]
+            src_graph = batch[edge_index[0]]       # [E]
+
+            # 只保留 local_idx < max_n 的边（防御性裁剪）
+            valid_edge = (src_local < max_n) & (tgt_local < max_n)
+            src_local = src_local[valid_edge]
+            tgt_local = tgt_local[valid_edge]
+            src_graph = src_graph[valid_edge]
+
+            if src_local.size(0) > 0:
+                adj[src_graph, src_local, tgt_local] = 1.0
+
         return EncoderOutput(
             node_emb      = node_emb,
             graph_emb     = graph_emb,
             dense_nodes   = dense_nodes,
             node_pad_mask = node_pad_mask,
             has_nodes     = has_nodes,
+            adj_matrix    = adj,
         )
 
 

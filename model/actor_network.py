@@ -127,6 +127,8 @@ class ActorNetwork(nn.Module):
             node_dim    = cfg.node_dim,
             num_actions = cfg.num_actions,
             max_atoms   = cfg.max_atoms,
+            num_heads   = cfg.ptr_num_heads,
+            dropout     = cfg.ptr_dropout,
         )
         self.label_decoder = LabelDecoder(
             vocab_size   = vocab_size,
@@ -239,6 +241,7 @@ class ActorNetwork(nn.Module):
             action_type    = tf.action,
             target_src_idx = tf.src,
             node_mask      = enc_out.node_pad_mask,
+            adj_matrix     = enc_out.adj_matrix,
             has_nodes      = enc_out.has_nodes,
         )
 
@@ -295,6 +298,7 @@ class ActorNetwork(nn.Module):
             action_type    = pred_action,
             target_src_idx = None,
             node_mask      = enc_out.node_pad_mask,
+            adj_matrix     = enc_out.adj_matrix,
             has_nodes      = enc_out.has_nodes,
         )
         pred_src = src_logits.argmax(dim=-1)   # [B]
@@ -315,6 +319,128 @@ class ActorNetwork(nn.Module):
             label_tokens = pred_label,
         )
         return edit, gru_hidden
+
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  推理接口：Top-K Sampling
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _sample_top_k(
+        self,
+        logits      : torch.Tensor,  # [B, vocab_size]
+        temperature : float = 1.0,
+        top_k       : int = 10,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Top-K 采样辅助函数
+        
+        Args:
+            logits: 未归一化的 logits [B, vocab_size]
+            temperature: 温度参数，越大越随机
+            top_k: 只从前 k 个候选中采样
+        
+        Returns:
+            sampled_idx: [B] 采样得到的索引
+            log_prob: [B] 该索引的对数概率
+        """
+        # 温度缩放
+        logits = logits / temperature
+        
+        # Top-K 过滤
+        top_k = min(top_k, logits.size(-1))
+        top_k_logits, top_k_indices = torch.topk(logits, top_k, dim=-1)
+        
+        # 计算概率并采样
+        probs = torch.softmax(top_k_logits, dim=-1)
+        sampled_idx_in_topk = torch.multinomial(probs, num_samples=1).squeeze(-1)  # [B]
+        sampled_idx = top_k_indices.gather(-1, sampled_idx_in_topk.unsqueeze(-1)).squeeze(-1)
+        
+        # 获取对数概率
+        log_probs = torch.log_softmax(top_k_logits, dim=-1)
+        sampled_log_prob = log_probs.gather(-1, sampled_idx_in_topk.unsqueeze(-1)).squeeze(-1)
+        
+        return sampled_idx, sampled_log_prob
+
+
+    @torch.no_grad()
+    def predict_step_sampling(
+        self,
+        history       : HistoryBatch,
+        gru_hidden    : Optional[torch.Tensor] = None,
+        label_max_len : Optional[int] = None,
+        temperature   : float = 1.0,
+        top_k         : int = 10,
+        **encoder_kwargs,
+    ) -> Tuple[EditStep, torch.Tensor, float]:
+        """
+        单步推理（采样模式）- 用于 Top-N 生成
+        
+        与 predict_step() 的区别：
+        - predict_step(): 贪心解码（argmax）
+        - predict_step_sampling(): Top-K 采样
+        
+        Args:
+            history: 当前步之前的历史
+            gru_hidden: GRU 隐状态
+            label_max_len: label 最大长度
+            temperature: 采样温度 (0.5=保守, 1.0=正常, 1.5=激进)
+            top_k: 只从前 k 个候选中采样
+            encoder_kwargs: 图数据 (x, edge_index, batch)
+        
+        Returns:
+            edit: EditStep（action_type, src_idx, tgt_idx, label_tokens）
+            gru_hidden: 更新后的隐状态
+            step_log_prob: 该步的总对数概率（用于序列排序）
+        """
+        if label_max_len is None:
+            label_max_len = self.label_max_len
+
+        # ── 1. 编码 ──────────────────────────────────────────────────
+        enc_out, graph_emb = self._encode(**encoder_kwargs)
+        decoder_state, gru_hidden = self.state_tracker(graph_emb, history, gru_hidden)
+
+        # ── 2. 采样 action ────────────────────────────────────────────
+        action_logits = self.action_predictor(decoder_state)  # [B, num_actions]
+        pred_action, action_log_prob = self._sample_top_k(
+            action_logits, temperature, top_k
+        )
+
+        # ── 3. 采样 src / tgt ─────────────────────────────────────────
+        src_logits, tgt_logits = self.pointer_network(
+            decoder_state  = decoder_state,
+            dense_nodes    = enc_out.dense_nodes,
+            action_type    = pred_action,
+            target_src_idx = None,  # 推理模式
+            node_mask      = enc_out.node_pad_mask,
+            adj_matrix     = enc_out.adj_matrix,
+            has_nodes      = enc_out.has_nodes,
+        )
+        pred_src, src_log_prob = self._sample_top_k(src_logits, temperature, top_k)
+        pred_tgt, tgt_log_prob = self._sample_top_k(tgt_logits, temperature, top_k)
+
+        # ── 4. 采样 label（自回归）────────────────────────────────────
+        pred_label, label_log_prob = self.label_decoder.sample_decode(
+            decoder_state = decoder_state,
+            action_type   = pred_action,
+            bos_token_id  = self.bos_token_id,
+            max_len       = label_max_len,
+            temperature   = temperature,
+            top_k         = top_k,
+        )
+
+        # ── 5. 计算该步总对数概率 ──────────────────────────────────────
+        step_log_prob = (
+            action_log_prob + src_log_prob + tgt_log_prob + label_log_prob
+        ).item()
+
+        edit = EditStep(
+            action_type  = pred_action,
+            src_idx      = pred_src,
+            tgt_idx      = pred_tgt,
+            label_tokens = pred_label,
+        )
+        return edit, gru_hidden, step_log_prob
+
 
     # ══════════════════════════════════════════════════════════════════
     #  推理接口：完整序列生成
@@ -380,3 +506,94 @@ class ActorNetwork(nn.Module):
             history = self._append_history(history, edit, label_len)
 
         return edit_steps
+    
+    @torch.no_grad()
+    def generate_top_n(
+        self,
+        n             : int = 5,
+        temperature   : float = 1.0,
+        top_k         : int = 10,
+        label_len     : Optional[int] = None,
+        max_steps     : Optional[int] = None,
+        label_max_len : Optional[int] = None,
+        **encoder_kwargs,
+    ) -> List[Tuple[List[EditStep], float]]:
+        """
+        生成 Top-N 个编辑序列（采样模式）
+        
+        策略：独立采样 N 次，按序列总对数概率排序
+        
+        Args:
+            n: 生成序列数量
+            temperature: 采样温度
+                - 0.5: 保守（接近贪心）
+                - 1.0: 正常（标准采样）
+                - 1.5: 激进（更多样化）
+            top_k: Top-K 截断值 (5-20 推荐)
+            label_len: HistoryBatch 的 label 维度
+            max_steps: 最大编辑步数
+            label_max_len: 每步 label 最大长度
+            encoder_kwargs: 图数据 (x, edge_index, batch)
+        
+        Returns:
+            List of (edit_sequence, total_log_prob)，按概率降序排列
+            
+        Example:
+            >>> results = model.generate_top_n(
+            ...     n=5, 
+            ...     temperature=0.8,
+            ...     x=graph.x, 
+            ...     edge_index=graph.edge_index, 
+            ...     batch=graph.batch
+            ... )
+            >>> for rank, (edits, score) in enumerate(results, 1):
+            ...     print(f"Rank {rank}: Score={score:.3f}, Steps={len(edits)}")
+        """
+        # ── 默认参数 ──────────────────────────────────────────────────
+        if label_len is None:
+            label_len = self.cfg.max_seq_len
+        if max_steps is None:
+            max_steps = self.cfg.max_hist_len
+        if label_max_len is None:
+            label_max_len = self.cfg.max_seq_len
+
+        # ── 推断设备信息 ───────────────────────────────────────────────
+        first_val  = next(iter(encoder_kwargs.values()))
+        batch_size = 1  # 当前只支持 batch_size=1
+        device     = first_val.device
+
+        results = []
+
+        # ── 独立采样 N 次 ──────────────────────────────────────────────
+        for sample_idx in range(n):
+            history        = HistoryBatch.empty(batch_size, label_len, device)
+            gru_hidden     = None
+            edit_steps     = []
+            total_log_prob = 0.0
+            finished       = torch.zeros(batch_size, dtype=torch.bool, device=device)
+
+            for step_idx in range(max_steps):
+                edit, gru_hidden, step_log_prob = self.predict_step_sampling(
+                    history       = history,
+                    gru_hidden    = gru_hidden,
+                    label_max_len = label_max_len,
+                    temperature   = temperature,
+                    top_k         = top_k,
+                    **encoder_kwargs,
+                )
+                edit_steps.append(edit)
+                total_log_prob += step_log_prob
+
+                # 检查终止
+                finished = finished | (edit.action_type == self.stop_action_id)
+                if finished.all():
+                    break
+
+                # 更新历史
+                history = self._append_history(history, edit, label_len)
+
+            results.append((edit_steps, total_log_prob))
+
+        # ── 按概率降序排序 ─────────────────────────────────────────────
+        results.sort(key=lambda x: x[1], reverse=True)
+        return results

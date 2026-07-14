@@ -11,7 +11,7 @@ LabelDecoder        : decoder_state + action + tgt_seq → label_logits [B, L, v
 """
 
 from __future__ import annotations
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -42,17 +42,17 @@ class ActionTypePredictor(nn.Module):
 # ══════════════════════════════════════════════════════════════════════
 #  Pointer Network
 # ══════════════════════════════════════════════════════════════════════
-# ══════════════════════════════════════════════════════════════════════
-#  Pointer Network
-# ══════════════════════════════════════════════════════════════════════
 
 class PointerNetwork(nn.Module):
     """
-    注意力指针网络：预测操作的 src / tgt 原子索引
+    多头边感知指针网络：预测操作的 src / tgt 原子索引
 
-    数据流：
-      state + action_emb → Q_src → 与 K_src 点积 → src_logits [B, max_nodes]
-      state + action_emb + src_emb → Q_tgt → 与 K_tgt 点积 → tgt_logits [B, max_nodes]
+    改进点（相对原始单头版本）：
+      1. 多 Head 注意力：hidden_dim 拆为 num_heads 组，并行捕捉不同化学上下文
+      2. 边感知偏置：邻接矩阵作为注意力偏置，键合原子获得更高 logit
+      3. 双线性 tgt 打分：Bilinear(src_node_feat, candidate_node_feat)
+         替代简单的 src_emb Embedding，显式建模原子对交互，减少级联错误
+      4. Scheduled Sampling（可选）：训练时以概率 p 用预测 src 替代 GT src
 
     Teacher Forcing：训练时传 target_src_idx，推理时用 argmax
     消融兼容：has_nodes=False 时直接返回全 -inf（不参与梯度）
@@ -68,30 +68,102 @@ class PointerNetwork(nn.Module):
         node_dim    : int,
         num_actions : int,
         max_atoms   : int,
+        num_heads   : int   = 4,
+        dropout     : float = 0.1,
     ):
         super().__init__()
+        assert hidden_dim % num_heads == 0, \
+            f"hidden_dim({hidden_dim}) 须整除 num_heads({num_heads})"
         self.num_actions = num_actions
         self.max_atoms   = max_atoms
+        self.num_heads   = num_heads
+        self.head_dim    = hidden_dim // num_heads
+        self._scale      = self.head_dim ** -0.5   # 按 head_dim 缩放
 
         self.action_emb = nn.Embedding(num_actions, hidden_dim)
         self.src_emb    = nn.Embedding(max_atoms,   hidden_dim)
         self.node_proj  = nn.Linear(node_dim, hidden_dim)
 
+        # ── 多 Head Q/K 投影 ─────────────────────────────────────────
+        # src: query = [decoder_state; action_emb]
         self.q_src = nn.Linear(hidden_dim * 2, hidden_dim)
         self.k_src = nn.Linear(hidden_dim,     hidden_dim)
-        self.q_tgt = nn.Linear(hidden_dim * 3, hidden_dim)
+
+        # tgt: query = [decoder_state; action_emb]（双线性版本不再拼接 src_emb）
+        self.q_tgt = nn.Linear(hidden_dim * 2, hidden_dim)
         self.k_tgt = nn.Linear(hidden_dim,     hidden_dim)
 
-        self._scale = hidden_dim ** -0.5
+        # ── 双线性 src→tgt 交互矩阵 ──────────────────────────────────
+        self.bilinear_src_tgt = nn.Bilinear(hidden_dim, hidden_dim, hidden_dim)
+
+        # ── 边偏置可学习缩放因子 ─────────────────────────────────────
+        self.edge_bias_scale = nn.Parameter(torch.tensor(1.0))
+
+        # ── Dropout ──────────────────────────────────────────────────
+        self.attn_dropout = nn.Dropout(dropout)
+
+    def _multi_head_attention(
+        self,
+        q_proj      : torch.Tensor,   # [B, H]  已通过 q_src/q_tgt 投影的 query
+        k_proj      : torch.Tensor,   # [B, N, H]  已通过 k_src/k_tgt 投影的 key
+        node_mask   : Optional[torch.Tensor] = None,  # [B, N] True=padding
+        adj_bias    : Optional[torch.Tensor] = None,  # [B, N, N] 边偏置（仅 src 使用全矩阵，tgt 传入 [B, N] 行切片）
+        is_tgt_bias : bool = False,  # True 时 adj_bias 是 [B, N] 行向量而非 [B, N, N] 矩阵
+    ) -> torch.Tensor:                 # → [B, N]
+        """
+        多 Head 缩放点积注意力 + 可选边偏置
+
+        Args:
+          q_proj   : 已投影的 query 向量 [B, H]
+          k_proj   : 已投影的 key 矩阵 [B, N, H]
+          node_mask: True=padding [B, N]
+          adj_bias : 边偏置，src 时 [B, N, N]，tgt 时 [B, N]
+          is_tgt_bias: True 时 adj_bias 以 additive 方式加到 logits 上
+        """
+        B, N, H = k_proj.shape
+
+        # 重塑为多头格式
+        q_mh = q_proj.view(B, self.num_heads, self.head_dim)        # [B, h, d]
+        k_mh = k_proj.view(B, N, self.num_heads, self.head_dim)     # [B, N, h, d]
+        k_mh = k_mh.transpose(1, 2)                                  # [B, h, N, d]
+
+        # 缩放点积
+        attn = torch.matmul(
+            q_mh.unsqueeze(2), k_mh.transpose(-1, -2)               # [B, h, 1, N]
+        ) * self._scale  # [B, h, 1, N]
+
+        # ── 边感知偏置 ──────────────────────────────────────────────
+        if adj_bias is not None:
+            if is_tgt_bias:
+                # tgt: adj_bias 是 [B, N]，加到每个 head
+                bias = adj_bias.unsqueeze(1).unsqueeze(2) * self.edge_bias_scale  # [B, 1, 1, N]
+            else:
+                # src: adj_bias 是 [B, N, N]，取 query 维度切片
+                bias = adj_bias.unsqueeze(1)[:, :, :1, :] * self.edge_bias_scale  # [B, 1, 1, N]
+            attn = attn + bias
+
+        # ── Mask padding ────────────────────────────────────────────
+        if node_mask is not None:
+            attn = attn.masked_fill(
+                node_mask.unsqueeze(1).unsqueeze(2), float("-inf")
+            )
+
+        attn = self.attn_dropout(attn)
+
+        # ── 多头平均聚合 ────────────────────────────────────────────
+        logits = attn.mean(dim=1).squeeze(1)  # [B, N]
+        return logits
 
     def forward(
         self,
-        decoder_state   : torch.Tensor,                       # [B, H]
-        dense_nodes     : torch.Tensor,                       # [B, max_nodes, node_dim]
-        action_type     : torch.Tensor,                       # [B]
-        target_src_idx  : Optional[torch.Tensor] = None,     # [B] Teacher Forcing
-        node_mask       : Optional[torch.Tensor] = None,     # [B, max_nodes] True=padding
-        has_nodes       : bool = True,
+        decoder_state            : torch.Tensor,                       # [B, H]
+        dense_nodes              : torch.Tensor,                       # [B, max_nodes, node_dim]
+        action_type              : torch.Tensor,                       # [B]
+        target_src_idx           : Optional[torch.Tensor] = None,     # [B] Teacher Forcing
+        node_mask                : Optional[torch.Tensor] = None,     # [B, max_nodes] True=padding
+        adj_matrix               : Optional[torch.Tensor] = None,     # [B, max_nodes, max_nodes]
+        has_nodes                : bool = True,
+        scheduled_sampling_prob  : float = 0.0,  # Scheduled Sampling 概率（0.0=纯Teacher Forcing）
     ):
         """
         返回: src_logits [B, max_nodes], tgt_logits [B, max_nodes]
@@ -99,9 +171,9 @@ class PointerNetwork(nn.Module):
         """
         B = decoder_state.size(0)
 
-        # ── 修复：兼容 has_nodes 是 Tensor 还是 bool 的情况 ──────────────
+        # ── 兼容 has_nodes 是 Tensor 还是 bool ───────────────────────
         if isinstance(has_nodes, torch.Tensor):
-            _has_nodes = has_nodes.any().item()  # 只要 batch 中有任何一个图有节点就算 True
+            _has_nodes = has_nodes.any().item()
         else:
             _has_nodes = bool(has_nodes)
 
@@ -112,124 +184,74 @@ class PointerNetwork(nn.Module):
             )
             return inf_logits, inf_logits
 
-        # ── 越界防御：clamp 所有 Embedding 索引 ──────────────────────
-        action_type_safe = action_type.clamp(0, self.num_actions - 1)  # [B]
-
-        # ── action 嵌入 ───────────────────────────────────────────────
+        # ── 越界防御 ────────────────────────────────────────────────
+        action_type_safe = action_type.clamp(0, self.num_actions - 1)
         a_emb = self.action_emb(action_type_safe)    # [B, H]
 
-        # ── 节点投影 ──────────────────────────────────────────────────
-        k_src = self.k_src(self.node_proj(dense_nodes))  # [B, max_nodes, H]
-        k_tgt = self.k_tgt(self.node_proj(dense_nodes))  # [B, max_nodes, H]
+        # ── 节点投影 ────────────────────────────────────────────────
+        node_feat = self.node_proj(dense_nodes)       # [B, N, H]
 
-        # ── src 预测 ──────────────────────────────────────────────────
-        q_src = self.q_src(
-            torch.cat([decoder_state, a_emb], dim=-1)
-        ).unsqueeze(1)                                    # [B, 1, H]
+        # ══════════════════════════════════════════════════════════════
+        #  src 预测（多头 + 边偏置）
+        # ══════════════════════════════════════════════════════════════
+        q_src = self.q_src(torch.cat([decoder_state, a_emb], dim=-1))  # [B, H]
+        k_src = self.k_src(node_feat)                                    # [B, N, H]
 
-        src_logits = torch.bmm(q_src, k_src.transpose(1, 2)).squeeze(1)  # [B, max_nodes]
-        src_logits = src_logits * self._scale
+        src_logits = self._multi_head_attention(
+            q_proj    = q_src,
+            k_proj    = k_src,
+            node_mask = node_mask,
+            adj_bias  = adj_matrix,   # [B, N, N] 全矩阵，键合原子对获得偏置
+            is_tgt_bias = False,
+        )
 
-        # padding 位置置 -inf
-        if node_mask is not None:
-            src_logits = src_logits.masked_fill(node_mask, float("-inf"))
-
-        # ── tgt 预测（Teacher Forcing / Greedy）──────────────────────
-        if target_src_idx is not None:
-            # 训练：使用真实 src
-            src_idx_safe = target_src_idx.clamp(0, self.max_atoms - 1)  # [B]
+        # ══════════════════════════════════════════════════════════════
+        #  tgt 预测（双线性打分 + 边偏置 + Scheduled Sampling）
+        # ══════════════════════════════════════════════════════════════
+        if target_src_idx is not None and self.training and scheduled_sampling_prob > 0:
+            # Scheduled Sampling：以概率 p 使用预测的 src（而非 GT）
+            use_pred = torch.rand(B, device=decoder_state.device) < scheduled_sampling_prob
+            pred_src = src_logits.argmax(dim=-1).clamp(0, self.max_atoms - 1)
+            src_idx_safe = torch.where(
+                use_pred,
+                pred_src,
+                target_src_idx.clamp(0, self.max_atoms - 1),
+            )
+        elif target_src_idx is not None:
+            src_idx_safe = target_src_idx.clamp(0, self.max_atoms - 1)
         else:
-            # 推理：使用预测 src（先屏蔽 padding 再 argmax）
             src_idx_safe = src_logits.argmax(dim=-1).clamp(0, self.max_atoms - 1)
 
-        s_emb = self.src_emb(src_idx_safe)               # [B, H]
+        # ── 双线性 src-tgt 交互打分 ──────────────────────────────────
+        # 取出 src 对应的节点特征
+        src_node_feat = node_feat[
+            torch.arange(B, device=node_feat.device), src_idx_safe
+        ]  # [B, H]
 
-        q_tgt = self.q_tgt(
-            torch.cat([decoder_state, a_emb, s_emb], dim=-1)
-        ).unsqueeze(1)                                    # [B, 1, H]
+        # Bilinear(src_node, candidate_node): [B*N, H] × [B*N, H] → [B*N, H]
+        N = node_feat.size(1)
+        src_expanded = src_node_feat.unsqueeze(1).expand(-1, N, -1).reshape(-1, node_feat.size(-1))  # [B*N, H]
+        candidates_flat = node_feat.reshape(-1, node_feat.size(-1))                                   # [B*N, H]
+        bilinear_out = self.bilinear_src_tgt(src_expanded, candidates_flat)  # [B*N, H]
+        bilinear_out = bilinear_out.view(B, N, -1)                            # [B, N, H]
 
-        tgt_logits = torch.bmm(q_tgt, k_tgt.transpose(1, 2)).squeeze(1)  # [B, max_nodes]
+        # 与 query 交互得到最终 tgt logits
+        q_tgt = self.q_tgt(torch.cat([decoder_state, a_emb], dim=-1))  # [B, H]
+        tgt_logits = (q_tgt.unsqueeze(1) * bilinear_out).sum(dim=-1)    # [B, N]
         tgt_logits = tgt_logits * self._scale
 
+        # ── 边偏置：src 原子的邻居获得额外 logit ─────────────────────
+        if adj_matrix is not None:
+            tgt_edge_bias = adj_matrix[
+                torch.arange(B, device=adj_matrix.device), src_idx_safe, :
+            ] * self.edge_bias_scale  # [B, N]
+            tgt_logits = tgt_logits + tgt_edge_bias
+
+        # ── Mask padding ────────────────────────────────────────────
         if node_mask is not None:
             tgt_logits = tgt_logits.masked_fill(node_mask, float("-inf"))
 
         return src_logits, tgt_logits   # [B, max_nodes], [B, max_nodes]
-
-
-# class PointerNetwork(nn.Module):
-#     """
-#     注意力指针网络：预测操作的 src / tgt 原子索引
-
-#     数据流：
-#       state + action_emb → Q_src → 与 K_src 点积 → src_logits [B, max_nodes]
-#       state + action_emb + src_emb → Q_tgt → 与 K_tgt 点积 → tgt_logits [B, max_nodes]
-
-#     Teacher Forcing：训练时传 target_src_idx，推理时用 argmax
-#     消融兼容：has_nodes=False 时直接返回全 -inf（不参与梯度）
-#     """
-#     def __init__(
-#         self,
-#         hidden_dim  : int,
-#         node_dim    : int,
-#         num_actions : int,
-#         max_atoms   : int,
-#     ):
-#         super().__init__()
-#         self.action_emb = nn.Embedding(num_actions, hidden_dim)
-#         self.src_emb    = nn.Embedding(max_atoms,   hidden_dim)
-#         self.node_proj  = nn.Linear(node_dim, hidden_dim)
-
-#         self.q_src = nn.Linear(hidden_dim, hidden_dim)
-#         self.k_src = nn.Linear(hidden_dim, hidden_dim)
-#         self.q_tgt = nn.Linear(hidden_dim, hidden_dim)
-#         self.k_tgt = nn.Linear(hidden_dim, hidden_dim)
-
-#     def forward(
-#         self,
-#         decoder_state   : torch.Tensor,             # [B, H]
-#         dense_nodes     : torch.Tensor,             # [B, max_nodes, node_dim]
-#         action_type     : torch.Tensor,             # [B]
-#         target_src_idx  : Optional[torch.Tensor] = None,  # [B] Teacher Forcing
-#         node_mask       : Optional[torch.Tensor] = None,  # [B, max_nodes] True=padding
-#         has_nodes       : bool = True,
-#     ):
-#         """
-#         返回: src_logits [B, max_nodes], tgt_logits [B, max_nodes]
-#         has_nodes=False 时返回全 -inf（FingerprintEncoder 消融用）
-#         """
-#         if not has_nodes:
-#             # 指纹模式：无节点概念，返回占位 logits（不参与有效 loss 计算）
-#             dummy = torch.full(
-#                 (decoder_state.size(0), 1), -1e9,
-#                 device=decoder_state.device
-#             )
-#             return dummy, dummy
-
-#         act_e      = self.action_emb(action_type)            # [B, H]
-#         nodes_proj = self.node_proj(dense_nodes)             # [B, max_nodes, H]
-
-#         # ── src ──────────────────────────────────────────────────────
-#         q_src      = self.q_src(decoder_state + act_e).unsqueeze(1)  # [B, 1, H]
-#         k_src      = self.k_src(nodes_proj)                          # [B, max_nodes, H]
-#         src_logits = torch.bmm(q_src, k_src.transpose(1, 2)).squeeze(1)  # [B, max_nodes]
-#         if node_mask is not None:
-#             src_logits = src_logits.masked_fill(node_mask, -1e9)
-
-#         # Teacher Forcing / 推理 argmax
-#         src_idx = (target_src_idx if target_src_idx is not None
-#                    else src_logits.argmax(dim=-1))
-#         src_idx = src_idx.clamp(0, self.src_emb.num_embeddings - 1)
-#         src_e   = self.src_emb(src_idx)                              # [B, H]
-
-#         # ── tgt ──────────────────────────────────────────────────────
-#         q_tgt      = self.q_tgt(decoder_state + act_e + src_e).unsqueeze(1)
-#         k_tgt      = self.k_tgt(nodes_proj)
-#         tgt_logits = torch.bmm(q_tgt, k_tgt.transpose(1, 2)).squeeze(1)
-#         if node_mask is not None:
-#             tgt_logits = tgt_logits.masked_fill(node_mask, -1e9)
-
-#         return src_logits, tgt_logits
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -331,3 +353,67 @@ class LabelDecoder(nn.Module):
                 break
 
         return generated   # [B, actual_len]
+
+    @torch.no_grad()
+    def sample_decode(
+        self,
+        decoder_state : torch.Tensor,   # [B, H]
+        action_type   : torch.Tensor,   # [B]
+        bos_token_id  : int,
+        max_len       : int,
+        temperature   : float = 1.0,
+        top_k         : int = 10,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        自回归采样解码 label 序列（用于 Top-N 生成）
+        
+        Args:
+            decoder_state: 解码器状态 [B, H]
+            action_type: 动作类型 [B]
+            bos_token_id: 起始 token ID
+            max_len: 最大生成长度
+            temperature: 采样温度 (0.5=保守, 1.0=正常, 1.5=激进)
+            top_k: 只从前 k 个候选中采样
+        
+        Returns:
+            tokens: [B, L] 生成的 token 序列
+            total_log_prob: [B] 序列总对数概率（用于排序）
+        """
+        B = decoder_state.size(0)
+        device = decoder_state.device
+        
+        # 初始化：只有 BOS token
+        tokens = torch.full((B, 1), bos_token_id, dtype=torch.long, device=device)
+        total_log_prob = torch.zeros(B, device=device)
+        finished = torch.zeros(B, dtype=torch.bool, device=device)
+
+        for _ in range(max_len - 1):
+            # 前向传播（复用 forward 方法）
+            logits = self.forward(decoder_state, action_type, tokens)[:, -1, :]  # [B, vocab]
+            
+            # 温度缩放
+            logits = logits / temperature
+            
+            # Top-K 过滤
+            top_k_val = min(top_k, logits.size(-1))
+            top_k_logits, top_k_indices = torch.topk(logits, top_k_val, dim=-1)
+            
+            # 计算概率并采样
+            probs = torch.softmax(top_k_logits, dim=-1)
+            sampled_idx_in_topk = torch.multinomial(probs, num_samples=1).squeeze(-1)  # [B]
+            next_token = top_k_indices.gather(-1, sampled_idx_in_topk.unsqueeze(-1)).squeeze(-1)
+            
+            # 累积对数概率（只累加未结束样本的概率）
+            log_probs = torch.log_softmax(top_k_logits, dim=-1)
+            token_log_prob = log_probs.gather(-1, sampled_idx_in_topk.unsqueeze(-1)).squeeze(-1)
+            total_log_prob += token_log_prob * (~finished).float()
+            
+            # 拼接 token
+            tokens = torch.cat([tokens, next_token.unsqueeze(1)], dim=1)
+            
+            # 检查 EOS（提前终止）
+            finished = finished | (next_token == self.eos_token_id)
+            if finished.all():
+                break
+
+        return tokens, total_log_prob
