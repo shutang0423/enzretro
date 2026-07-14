@@ -14,7 +14,7 @@ from config.config import PATH_CFG, ID_TO_ACTION, RLInferenceConfig, STOP_ACTION
 from model.actor_network import ActorNetwork
 from utils.chem import smiles_to_graph
 from tokenizer.tokenizer import LabelTokenizer
-from rl.rl_inference import RLInferenceConfig, RLInference
+from rl.rl_inference2 import RLInferenceConfig, RLInference
 from rl.reward_calculator import RewardCalculator
 
 
@@ -26,7 +26,8 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 def test_single_example(test_smiles: str = 'CCOC(=O)C1CCC2(CC1)OCCO2',
                         checkpoint_path: Path = PATH_CFG.CKPT_BEST_MODEL_FILE,
                         inference_method: str = "monte_carlo",
-                        reward_method: str = "step_comparison"):
+                        reward_method: str = "step_comparison",
+                        beam_size: int = 3):
     
     print(f"Testing molecule: {test_smiles}")
     
@@ -71,40 +72,41 @@ def test_single_example(test_smiles: str = 'CCOC(=O)C1CCC2(CC1)OCCO2',
     # 初始化强化学习推理器
     rl_config = RLInferenceConfig(inference_method=inference_method)
     rl_inference = RLInference(model, config=rl_config)
-    edit_steps = rl_inference.infer(encoder_kwargs, target_steps=None)
     
+    # 执行推理，支持多结果输出
+    edit_steps_list = rl_inference._beam_search_inference(encoder_kwargs, target_steps=None, beam_size=beam_size)
     
-    # with torch.no_grad():
-    #     edit_steps = model.generate(**encoder_kwargs)
+    # 处理输出结果
+    print(f"\nGenerated {len(edit_steps_list)} candidate(s):")
     
-    # 8. 处理输出结果
-    print("\nGenerated edit steps:")
-    for i, step in enumerate(edit_steps):
-        action_type = step.action_type.item()
-        # 转换动作类型
-        action_name = ID_TO_ACTION[action_type]
+    for candidate_idx, edit_steps in enumerate(edit_steps_list):
+        print(f"\n=== Candidate {candidate_idx + 1} ===")
+        for i, step in enumerate(edit_steps):
+            action_type = step.action_type.item()
+            # 转换动作类型
+            action_name = ID_TO_ACTION[action_type]
 
-        if action_type == STOP_ACTION_ID:
-            src_idx, tgt_idx, label_str = None, None, None  # Terminate
-        else:
-            src_idx = step.src_idx.item()
-            tgt_idx = step.tgt_idx.item()
-        
-            # 解码标签序列
-            label_tokens = step.label_tokens.squeeze(0).tolist()
-            label_str = tokenizer.decode(label_tokens, skip_special_tokens=True)
+            if action_type == STOP_ACTION_ID:
+                src_idx, tgt_idx, label_str = None, None, None  # Terminate
+            else:
+                src_idx = step.src_idx.item()
+                tgt_idx = step.tgt_idx.item()
             
-        
-        print(f"Step {i+1}:")
-        print(f"  Action: {action_name} (id={action_type})")
-        print(f"  Source atom: {src_idx}")
-        print(f"  Target atom: {tgt_idx}")
-        print(f"  Label: {label_str}")
-        print()
-        
-        if action_type == 4:  # Terminate
-            print("Termination action detected, stopping generation")
-            break
+                # 解码标签序列
+                label_tokens = step.label_tokens.squeeze(0).tolist()
+                label_str = tokenizer.decode(label_tokens, skip_special_tokens=True)
+                
+            
+            print(f"Step {i+1}:")
+            print(f"  Action: {action_name} (id={action_type})")
+            print(f"  Source atom: {src_idx}")
+            print(f"  Target atom: {tgt_idx}")
+            print(f"  Label: {label_str}")
+            print()
+            
+            if action_type == STOP_ACTION_ID:  # Terminate
+                print("Termination action detected, stopping generation")
+                break
 
 # def test_more():
 #     """
@@ -224,4 +226,3 @@ if __name__ == "__main__":
     
     # print("2. Testing test set")
     # test_more()
-

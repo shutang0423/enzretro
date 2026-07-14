@@ -31,7 +31,7 @@ from utils.chem import get_atom_feat_dim
 ACTION_TYPES: List[str] = [
     "DeleteBond",    # 0
     "ChangeBond",    # 1
-    "AddBond",       # 2
+    #"AddBond",       # 2
     "AttachGroup",   # 3
     "ChangeAtom",    # 4
     # "AddAtom",     # 暂不启用
@@ -60,7 +60,7 @@ class PathConfig:
     只需传入 project_name，其余路径全部自动推导。
     __post_init__ 会自动创建所有 *_DIR 目录。
     """
-    project_name: str = "pretrain_20260426_gat_manual"
+    project_name: str = "pretrain_20260531_gat_equal"
 
     # ── 根目录 ────────────────────────────────────────────────────────
     ROOT_DIR: Path = field(default_factory=lambda: Path("."))
@@ -170,6 +170,13 @@ class ModelConfig:
     bos_token_id : int = 1
     eos_token_id : int = 2
 
+    # ── Pointer Network 超参 ──────────────────────────────────────────
+    ptr_num_heads       : int   = 4        # 多 Head 注意力头数（须整除 hidden_dim）
+    ptr_use_edge_bias   : bool  = True     # 是否启用边感知注意力偏置
+    ptr_use_bilinear_tgt: bool  = True     # 是否启用双线性 src-tgt 配对打分
+    ptr_dropout         : float = 0.1      # Pointer 注意力 dropout
+    ptr_scheduled_sampling_prob : float = 0.0  # Scheduled Sampling 概率（0.0=关闭）
+
 
 # ══════════════════════════════════════════════════════════════════════
 #  StageConfig & TrainConfig
@@ -209,7 +216,7 @@ class TrainConfig:
 
     # ── Loss 策略（消融实验切换点）───────────────────────────────────
     # "uncertainty" | "equal" | "manual" | "single_task"
-    loss_strategy: str        = "manual"
+    loss_strategy: str        = "equal"
 
     # manual 策略：各任务权重（顺序与 TASK_NAMES 对齐）
     loss_weights : List[float] = field(
@@ -224,15 +231,29 @@ class TrainConfig:
     uw_s_max     : float =  2.5
 
     # ── 课程学习阶段（顺序执行）──────────────────────────────────────
-    # 默认：直接联合训练（不分阶段）
+    # 三阶段渐进式：Action → Action+Pointer → Full Joint
     stages: List[StageConfig] = field(default_factory=lambda: [
         StageConfig(
-            name         = "Joint-All",
-            epochs       = 300,
+            name         = "Action-Only",
+            epochs       = 50,
+            active_tasks = ["action"],
+            freeze       = ["pointer_network", "label_decoder"],
+            lr_scale     = 1.0,
+        ),
+        StageConfig(
+            name         = "Action+Pointer",
+            epochs       = 100,
+            active_tasks = ["action", "src", "tgt"],
+            freeze       = ["label_decoder"],
+            lr_scale     = 1.0,
+        ),
+        StageConfig(
+            name         = "Full-Joint",
+            epochs       = 150,
             active_tasks = [],            # 空 = 全部激活
             freeze       = [],
-            lr_scale     = 1.0,
-        )
+            lr_scale     = 0.5,
+        ),
     ])
 
     # ── 验证 & 保存策略 ───────────────────────────────────────────────
